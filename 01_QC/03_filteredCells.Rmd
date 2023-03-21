@@ -1,0 +1,59 @@
+---
+title: "Subsetting Cells"
+author: "kou"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, include = T)
+```
+
+## "Finalizing" filtered cells for downstream cells
+Want to subset cells that passed Seurat (RNA) and ArchR (ATAC) filtering.
+```{r load}
+library(Seurat)
+library(ArchR)
+library(tidyverse)
+```
+
+```{r data import}
+seur_flt = readRDS("./01_QC/rds/01_seur_filt.rds")
+archR_flt = loadArchRProject("./01_QC/ArchRproj_flt")
+
+# merge seurat, get metadata
+seur_flt = merge(seur_flt[[1]], 
+                 seur_flt[-1],
+                 add.cell.ids = names(seur_flt))
+
+# rename cell_id columns to match style of ArchR
+## TO DO: find a different way, so not to change style of Seurat! like get indeces
+seur_flt$cell_ids = gsub("_","#",colnames(seur_flt))
+
+# get metadata
+archR_meta = getCellColData(archR_flt)
+seur_meta = seur_flt@meta.data
+```
+
+Get cell IDs that are present in both
+```{r get keep ids, include=T}
+atac_cells = archR_flt$cellNames
+rna_cells = seur_meta$cell_ids
+
+# get intersection
+keep_ids = intersect(atac_cells,rna_cells)
+```
+
+Subset Seurat and ArchR objects
+```{r subset rna, include=T}
+# subset
+seur_keep = subset(seur_flt, subset = (cell_ids %in% keep_ids))
+saveRDS(seur_keep, "./01_QC/rds/03_seur_keep.rds")
+
+archR_keep = archR_flt[archR_flt$cellNames %in% keep_ids,]
+saveArchRProject(ArchRProj = archR_keep, 
+                             outputDirectory = "01_QC/ArchRproj_keep", 
+                             load = F)
+```
+
+

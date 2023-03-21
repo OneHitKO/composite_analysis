@@ -1,0 +1,435 @@
+---
+title: "Integration"
+author: "kou"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,include=T,message=F)
+```
+
+```{r libraries, warning=F}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(shiny)
+library(qs)
+library(reticulate)
+
+# always set seed!!! need to repeat
+set.seed(105)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# set python
+use_python("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env/bin")
+use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
+``` 
+
+```{r data import}
+ln_id = c("LN0025","LN0177","LN0193","LN0438")
+sct_list = qread("01_QC/rds/04_split_sct.qs")
+atac_list = qread("02_integration/rds/01_atac_seurat.qs")
+```
+
+## Adding ATAC and RNA modalities together, per Sample
+Did this so all information is in the same object. Will still need to integrate samples by each modality separately (batch correct each modality), then integrate the modalities (with all samples) together.
+
+More info: https://github.com/satijalab/seurat/issues/5346
+```{r integrate, eval=F}
+# create function to add atac and gene score activity assays
+transfer = function(sct_seur, atac_seur){
+  
+  # transfer assays
+  sct_seur[["ATAC"]] = atac_seur[["ATAC"]]
+  sct_seur[["GeneScoreImputed"]] = atac_seur[["GeneScoreImputed"]]
+  
+  # transfer umap embeddings
+  sct_seur[["atacUMAP"]] = CreateDimReducObject(embeddings = Embeddings(atac_seur@reductions$atacUMAP),
+                                                assay = "ATAC",
+                                                key = "atacUMAP_")
+  
+  # transfer iterative lsi embeddings
+  sct_seur[["iterLSI_4"]] = CreateDimReducObject(embeddings = Embeddings(atac_seur@reductions$iterLSI_4),
+                                                assay = "ATAC",
+                                                key = "atacIterLSI4_")
+  
+  return(sct_seur)
+}
+
+# add assays and atac umap
+allModalities = map2(sct_list, atac_list, ~ transfer(.x,.y))
+
+# test cellnames match
+lapply(1:4, function(x){
+  isSame = Cells(allModalities[[x]][["SCT"]]) == Cells(allModalities[[x]][["ATAC"]])
+  all(isSame)
+})
+
+# get atac data
+atac_meta = lapply(atac_list, function(x) x@meta.data)
+
+# add metadata, which by default matches the order based on rownames! 
+allModalities = map2(allModalities, atac_meta, ~ AddMetaData(.x,.y))
+
+qsave(allModalities, "02_integration/rds/02_allModalities.qs", nthreads = 16)
+```
+
+
+## Integrate and batch correct SCT modalities
+Samples were first normalized independently using SC Transform v2 (see 01_QC/04_gex_norm_final.Rmd), then integrated using pearson residuals.
+3000 features were used as anchors for integration. Including more anchors is not necessarily beneficial, as the additional feautures would have lower weights. 
+
+More info: https://satijalab.org/seurat/articles/sctransform_v2_vignette.html
+```{r integrate RNA}
+# ranks features by the number of datasetes that they're variable in, returns top scoring features
+features = SelectIntegrationFeatures(object.list = sct_list, nfeatures = 3000, assay = rep("SCT",length(sct_list)))
+
+sct_list = PrepSCTIntegration(object.list = sct_list, assay = "SCT", anchor.features = features)
+
+# integrate the datasets
+anchors = FindIntegrationAnchors(object.list = sct_list, assay = rep("SCT",length(sct_list)), normalization.method = "SCT", anchor.features = features)
+sct_integrated = IntegrateData(anchorset = anchors, normalization.method = "SCT")
+```
+
+### Dimensional Reduction
+After integrating data sets, a new "integrated" assay was created, and all reductions were removed. Original RNA and SCT counts are also stored. Metadata seems to be rbind() of metadata from list of Seurat objects. 
+
+Next, perform dimensionality reduction to cluster cells and identify marker genes on the "integrated" assay.
+
+Note: set python interpreter to venv through project options, also used reticulate in set up.
+```{r combined sct umap, warning=F}
+# create umap on sct
+sct_integrated = RunPCA(sct_integrated, reduction.name = "sctPCA", verbose=F) %>%
+  RunUMAP(., reduction = "sctPCA", dims = 1:30, reduction.key = "sctUMAP_", reduction.name = "sctUMAP", verbose=F) %>% 
+  FindNeighbors(., reduction = "sctPCA", dims = 1:30)
+
+# clustering with leiden, seurat clusters are assigned to integrated_snn_res.1.15
+sct_integrated = FindClusters(sct_integrated, resolution = seq(0.4,1.15,by = 0.25), algorithm = 4, method = "igraph", random.seed = 1)
+```
+
+
+### Visualization
+```{r umap plots}
+umap = DimPlot(sct_integrated, reduction = "sctUMAP", pt.size = 0.25, group.by = "Sample")+
+  theme(aspect.ratio = 3/3) +
+  labs(title = "RNA - Integrated")
+
+umap_splitSample = DimPlot(sct_integrated, reduction = "sctUMAP", split.by = "Sample", pt.size = 0.25)+
+  theme(aspect.ratio = 3/3) +
+  labs(title = "RNA - Integrated")
+
+umap_clusters = DimPlot(sct_integrated, reduction = "sctUMAP", pt.size = 0.25, group.by = "seurat_clusters")+
+  theme(aspect.ratio = 3/3) +
+  labs(title = "RNA - Integrated")
+
+ggsave("02_integration/figs/02_sctUMAP.png", plot = umap, width = 7, height = 6)
+ggsave("02_integration/figs/02_sctUMAP_splitSamples.png", plot = umap_splitSample, width = 14, height = 6)
+ggsave("02_integration/figs/02_sctUMAP_clsuters.png", plot = umap_clusters, width = 7, height = 6)
+
+umap 
+umap_splitSample
+umap_clusters
+```
+Plot marker genes / cluster
+TO DO: make shiny app
+
+https://www.nature.com/articles/s41467-019-12464-3
+```{r violin marker genes sct}
+DefaultAssay(sct_integrated) = "SCT"
+
+markers = c("MS4A1","CD3D")
+
+vlnGeneral = VlnPlot(sct_integrated, features = markers, pt.size = 0.01, ncol = 1) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("02_integration/figs/02_vln_BvsTmarkers2.png", plot = vlnGeneral, width = 5, height = 10)
+
+vlnGeneral
+```
+
+### Save/Load sct_integrated
+```{r eval = F}
+qsave(sct_integrated, "02_integration/rds/02_sct_integrated.qs", nthreads = 16)
+sct_integrated = qread("02_integration/rds/02_sct_integrated.qs")
+```
+
+
+## Integrate and batch correct ATAC modalities
+Samples are integrated through their low-dimensional cell embeddings instead of their count matrix of binned genome (reciprocal LSI). Because the binned genome is the same for all samples, the features will be the same. 
+
+More info: https://stuartlab.org/signac/articles/integrate_atac.html
+
+### Preprocessing
+First need to preprocess a little bit and keep ranges of binned genome containing insertion events in at least 50 cells for each sample.
+Furthermore, each sample should have a subset of the *same ranges* to perform dimension reduction.
+
+Notes on sparse matrix slots:https://statisticaloddsandends.wordpress.com/2020/03/31/what-is-a-dgcmatrix-object-made-of-sparse-matrix-format-in-r/
+```{r keep ranges}
+# get count matrices
+# confirmed that binned ranges are in same order in each file
+count_list = lapply(atac_list, function(x) x@assays$ATAC@counts)
+names(count_list) = ln_id
+
+# get row indices of count table were 
+keepFrags = lapply(count_list, function(sparseM){
+  
+  # binarize the matrix; if there's a value, assign 1
+  sparseM@x[] = T
+  
+  # find which fragments (rows) had insertion events >= 50 cells
+  keepFrags = rownames(sparseM)[rowSums(sparseM) >= 50]
+  
+  return(keepFrags)
+})
+
+# get the union of row indices to subset chromatinAssay
+keepFrags = do.call(c,keepFrags) %>% unique(.)
+
+# subset atac to keep union of features found in >= 50 cells
+new_atac = map(atac_list, ~ DietSeurat(.x,
+                                       features = keepFrags,
+                                       assays = "ATAC",
+                                       dimreducs = c("atacUMAP","iterLSI_4")))
+
+# add gene score activity and cell col identifies
+new_atac = lapply(seq_along(new_atac), function(x){
+  new_atac[[x]][["GeneScoreImputed"]] = atac_list[[x]][["GeneScoreImputed"]]
+  return(new_atac[[x]])
+})
+```
+
+### Integration with new LSI
+Because the data is sparse, the samples are integrated through a shared low-dimensional space by "reciprocal LSI" by projecting each dataset into the next dataset's LSI space.
+Therefore, need to create a shared LSI space by merging all datasets first. 
+
+More info on integration in Seurat: https://www.sciencedirect.com/science/article/pii/S0092867419305598?via%3Dihubs
+More info on methods to calculate LSI: http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/
+```{r shared embed}
+# merge datasets
+merged_atac = merge(new_atac[[1]],new_atac[2:4], add.cell.ids = NULL)
+
+# process combined dataset
+merged_atac = FindTopFeatures(merged_atac, min.cutoff = 50) %>%
+  RunTFIDF(., method = 3) %>%
+  RunSVD(.)
+
+# check whether components correlate with seq depth
+DepthCor(merged_atac)
+
+# UMAP of merged data before embedding
+merged_atac = RunUMAP(merged_atac, reduction = "lsi", dims = 2:30)
+beforeInt = DimPlot(merged_atac,group.by = "Sample", pt.size = 0.15) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("02_integration/figs/02_atacUMAP_beforeIntegrateEmbed.png", width = 6, height = 6)
+beforeInt
+```
+
+```{r integrate}
+# get vector of all features (same for all samples)
+features = rownames(new_atac[[1]])
+
+# calculate lsi in new_atac
+new_atac = map(new_atac, ~ FindTopFeatures(.x, min.cutoff = 50) %>%
+                 RunTFIDF(., method = 3) %>%
+                 RunSVD(.))
+
+# find integration anchors, remove 1st PC
+anchorsATAC = FindIntegrationAnchors(
+  object.list = new_atac,
+  anchor.features = features,
+  reduction = "rlsi",
+  dims = 2:30
+  )
+
+# integrate lsi embeddings
+atac_integrated = IntegrateEmbeddings(
+  anchorset = anchorsATAC,
+  reductions = merged_atac[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate = 1:30
+  )
+
+# check which component correlates w sequencing depth
+DepthCor(atac_integrated, reduction = "integrated_lsi")
+
+# create umap embedding
+atac_integrated = RunUMAP(atac_integrated, reduction = "integrated_lsi", dims=2:30, reduction.name = "atacUMAP", reduction.key = "atacUMAP_")
+```
+
+### Save/Load atac_integrated
+```{r save atac}
+qsave(atac_integrated, "02_integration/rds/02_atac_integrated.qs", nthreads = 16)
+atac_integrated = qread("02_integration/rds/02_atac_integrated.qs")
+```
+
+### Visualization
+UMAP embeddings
+```{r umap atac after int}
+afterInt = DimPlot(atac_integrated,group.by = "Sample", pt.size = 0.15) + 
+  theme(aspect.ratio = 3/3) +
+  labs(title = "ATAC - Integrated")
+
+afterInt_split = DimPlot(atac_integrated,group.by = "Sample", pt.size = 0.15, split.by = "Sample") + 
+  theme(aspect.ratio = 3/3) +
+  labs(title = "ATAC - Integrated")
+
+ggsave("02_integration/figs/02_atacUMAP_integrated.png",afterInt, width = 6, height = 6)
+ggsave("02_integration/figs/02_atacUMAP_integrated_splitSample.png",afterInt_split, width = 14, height = 6)
+
+afterInt
+afterInt_split
+```
+Gene Score Activity
+```{r umap gene score atac}
+# get embeddings
+atacumap = as.data.frame(atac_integrated@reductions$atacUMAP@cell.embeddings)
+atacumap$Sample = gsub("_.*","",rownames(atacumap))
+
+# genes of interest
+genes = c("MS4A1","PAX5","CXCR5","CD3D","CD4","CD8A","FOXP3","TBX21","GATA3","BCL6","PDCD1","HAVCR2","BCL2","MKI67")
+
+# get genescore matrix 
+genescore = atac_integrated@assays$GeneScoreImputed@data
+genescore = genescore[genes,]
+
+# join, after confirming all(rownames(atacumap) == colnames(genescore))
+atacumap = cbind(atacumap, t(genescore))
+
+# TO DO: make shiny app or function
+ms4a1 = ggplot(atacumap, aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = MS4A1), size = 0.05) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(Sample))
+
+cd3d = ggplot(atacumap, aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = CD3D), size = 0.05) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(Sample))
+
+ggsave("02_integration/figs/02_atacUMAP_MS4A1.png", ms4a1, width = 10, height = 5)
+ggsave("02_integration/figs/02_atacUMAP_CD3D.png", cd3d, width = 10, height = 5)xs
+```
+
+Test w/ doublet score
+```{r atac umap doublet}
+# get metadata, after checking all(rownames(atac_integrated@meta.data) == rownames(atacumap))
+atacumap = cbind(atacumap, atac_integrated@meta.data[,colnames(atac_integrated@meta.data) != "Sample"])
+
+filter(atacumap, DoubletScore < 1) %>%
+ggplot(., aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = DoubletEnrichment), size = 0.05) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(Sample))
+```
+
+## Integration and WNN clustering of combined RNA + ATAC Modalities 
+https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis.html#wnn-analysis-of-10x-multiome-rna-atac-1
+```{r combine assays}
+# reset the active assays
+DefaultAssay(sct_integrated) = "integrated"
+DefaultAssay(atac_integrated) = "ATAC"
+
+# add assays to sct
+sct_integrated[["ATAC"]] = atac_integrated[["ATAC"]]
+sct_integrated[["GeneScoreImputed"]] = atac_integrated[["GeneScoreImputed"]]
+
+# transfer embeddings
+sct_integrated[["atacUMAP"]] = CreateDimReducObject(embeddings = Embeddings(atac_integrated@reductions$atacUMAP),
+                                                    assay = "ATAC",
+                                                    key = "atacUMAP_")
+
+sct_integrated[["integrated_lsi"]] = CreateDimReducObject(embeddings = Embeddings(atac_integrated@reductions$integrated_lsi),
+                                                          assay = "ATAC",
+                                                          key = "integratedlsi_")
+
+sct_atac_combined = sct_integrated
+```
+
+Perform WNN analysis
+```{r wnn}
+sct_atac_combined = FindMultiModalNeighbors(sct_atac_combined, 
+                                            reduction.list = list("sctPCA","integrated_lsi"),
+                                            dims.list = list(1:50,2:50))
+
+
+# create wnn embeddings and perform clustering
+sct_atac_combined = RunUMAP(sct_atac_combined, nn.name = "weighted.nn", reduction.name = "wnnUMAP", reduction.key = "wnnUMAP_")
+sct_atac_combined = FindClusters(sct_atac_combined, algorith = 4, method = "igraph", graph.name = "wsnn", verbose = F)
+```
+
+### Save/Load sct_atac_combined
+```{r}
+qsave(sct_atac_combined,"02_integration/rds/02_sct_atac_combined.qs",nthreads=16)
+# sct_atac_combined = qread("02_integration/rds/02_sct_atac_combined.qs")
+```
+
+### Visualization
+```{r wnnumap}
+wnnumap = DimPlot(sct_atac_combined, reduction = "wnnUMAP", label = T) +
+  theme(aspect.ratio = 3/3,
+        legend.position = "none")
+
+wnnumap_split = DimPlot(sct_atac_combined, reduction = "wnnUMAP", split.by = "Sample") +
+  theme(aspect.ratio = 3/3)
+
+ggsave("02_integration/figs/02_wnnUMAP.png",wnnumap, width = 6, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_splitSample.png",wnnumap_split, width = 16, height = 6)
+```
+
+Find B cell clusters
+```{r wnnumap B cells}
+# get embeddings
+wnn_df = as.data.frame(sct_atac_combined@reductions$wnnUMAP@cell.embeddings)
+wnn_df$Sample = gsub("_.*","",rownames(wnn_df))
+
+# genes of interest
+genes = c("MS4A1","PAX5","CXCR5","CD3D","CD4","CD8A","FOXP3","TBX21","GATA3","BCL6","PDCD1","HAVCR2","BCL2","MKI67")
+
+# get RNA counts
+rna = sct_atac_combined@assays$RNA@data
+rna_genes = rna[genes,]
+
+# join, after confirming all(rownames(wnn_df) == colnames(sct_genes))
+wnn_df = cbind(wnn_df, t(as.matrix(rna_genes)))
+
+ms4a1rna = ggplot(wnn_df, aes(wnnUMAP_1,wnnUMAP_2)) +
+  geom_jitter(aes(color = MS4A1), size = 0.01) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  facet_grid(cols = vars(Sample)) +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank())
+
+cd3drna = ggplot(wnn_df, aes(wnnUMAP_1,wnnUMAP_2)) +
+  geom_jitter(aes(color = CD3D), size = 0.01) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  facet_grid(cols = vars(Sample)) +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank())
+
+ggsave("02_integration/figs/02_wnnUMAP_MS4A1_rna.png",ms4a1rna, width = 16, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_CD3D_rna.png",cd3drna, width = 16, height = 6)
+
+ms4a1rna
+cd3drna
+```
+

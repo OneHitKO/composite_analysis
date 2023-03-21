@@ -1,0 +1,227 @@
+---
+title: "QC of composite lymphoma 10X multiome data: GEX"
+author: "kou"
+date: "220102"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## QC of GEX of composite LN samples
+Resources:
+* https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/04_SC_quality_control.md
+* https://www.10xgenomics.com/resources/analysis-guides/common-considerations-for-quality-control-filters-for-single-cell-rna-seq-data
+```{r setup, include=T, message=F}
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(ggridges)
+theme_set(theme_bw())
+
+set.seed(105)
+```
+
+### GEX data import
+Individual modalities are preprocessed separately prior to integration.
+```{r import data, include=T}
+# list of samples
+ln_id = c("LN0025","LN0177","LN0193","LN0438")
+
+path = paste0("~/projects/composite/cellranger/",ln_id,"/outs/filtered_feature_bc_matrix/")
+
+# get list of files from cellranger outs folders
+# contains both gex AND atac
+data = lapply(path,Read10X)
+names(data) = ln_id
+
+# create list of unfiltered seurat objects from GEX only
+seur_unfilt = map2(data, names(data), ~ CreateSeuratObject(.x$`Gene Expression`, project = .y))
+```
+
+### QC metrics
+* UMI count (nCount_RNA)
+* Gene features count (nFeature_RNA)
+* Number of genes detected per UMI for complexity, see novelty score (log10GenesperUMI)
+* Perc. of mitochondrial reads (ratio_mt)
+* to do: calc number of reads w/ TSO, need to look into fastq files
+```{r add to metadata, include=F}
+# calc ratio of UMI/gene
+calc_noveltyScore = function(seuObj){
+  seuObj$log10Genes_per_UMI = log10(seuObj$nFeature_RNA) / log10(seuObj$nCount_RNA)
+  return(seuObj)
+}
+
+# calc ratio of MT genes
+calc_mt = function(seuObj){
+  seuObj$ratio_mt = PercentageFeatureSet(seuObj, pattern = "^MT-")/100
+  return(seuObj)
+} 
+
+seur_unfilt = lapply(seur_unfilt, calc_noveltyScore)
+seur_unfilt = lapply(seur_unfilt, calc_mt)
+```
+
+```{r plot all test2, include=T, warning=F}
+# get list of metadata
+## TO DO: troubleshoot this??
+metadata = map2(seur_unfilt, names(seur_unfilt),
+                ~.x@meta.data %>%
+                  rownames_to_column(var = "cell_ID") %>%
+                  mutate(LN_ID = .y)) 
+
+metadata = do.call(rbind,metadata)
+
+### UNNECCESSARY? can delete later ####
+# also pivot for plotting purposes, possibly unneccessary!
+metadata_piv = pivot_longer(metadata, cols = c("nCount_RNA","nFeature_RNA","log10Genes_per_UMI","ratio_mt"),
+                            names_to = "metric",
+                            values_to = "value")
+
+# boxplot, all
+ggplot(metadata_piv, aes(LN_ID,value)) +
+  geom_boxplot(aes(fill = LN_ID),
+               alpha = 0.5,
+               outlier.shape = NA) +
+  theme(aspect.ratio = 4/3,
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  scale_y_log10(n.breaks = 8) +
+  facet_grid(rows = vars(metric), scales = "free") + 
+  labs(x = NULL, y = "Value")
+
+ggsave("01_QC/figs/01_gexQC_unflt.png")
+```
+
+Individual density plots + cut offs
+TO DO: PLOT with IQR cutoffs! 
+```{r plots w cutoffs, include=T}
+# plotting function
+plot_ridges = function(metadata.df, metric){
+  p_out = ggplot(metadata.df,aes(.data[[metric]],fct_rev(LN_ID))) +
+    geom_density_ridges(aes(fill = LN_ID), alpha = 0.5) +
+    theme(aspect.ratio = 3/3,
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          panel.grid = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5)) +
+    scale_x_log10() +
+    labs(title = metric)
+  
+  return(p_out)
+}
+
+# nCount_RNA (UMIs)
+p1 = plot_ridges(metadata,"nCount_RNA")+
+  geom_vline(xintercept = c(500,40000), alpha = 0.5) +
+  labs(subtitle = "[500,40000]")
+
+# nFeature_RNA (Unique Genes)
+p2 = plot_ridges(metadata,"nFeature_RNA")+
+  geom_vline(xintercept = c(300,7000), alpha = 0.5) +
+  labs(subtitle = "[300,7000]")
+
+# complexity
+p3 = plot_ridges(metadata,"log10Genes_per_UMI")+
+  geom_vline(xintercept = 0.85, alpha = 0.5) +
+  labs(subtitle = "[0.85,1.0]")
+
+# mt reads
+p4 = plot_ridges(metadata,"ratio_mt")+
+  geom_vline(xintercept = 0.15, alpha = 0.5) +
+  scale_x_continuous() +
+  xlim(c(0,0.3)) +
+  labs(subtitle = "[0,0.15]")
+
+# TO DO: remove more white space, save plot
+ggarrange(p1,p2,p3,p4,
+          nrow=2,ncol=2,
+          common.legend = T, legend = "right")
+
+ggsave("01_QC/figs/01_gexQC_densityCutoff.png")
+```
+### Determining outliers by IQR
+Mark which cells are outliers based on whether nCount_RNA and nFeature_RNA < Q1-1.5IQR or > Q3 + 1.5IQR.
+```{r IQR calc, include=T}
+get_q1 = function(x) quantile(x)[["25%"]]
+get_q3 = function(x) quantile(x)[["75%"]]
+
+# function to get which cells are outliers
+find_outliers = function(seurObj){
+  # get nCount_RNA and nFeatures_RNA
+  nUMI = seurObj$nCount_RNA
+  nGene = seurObj$nFeature_RNA
+  
+  # get names of cells which are outliers 
+  nUMI_out = which(nUMI < (get_q1(nUMI) - 1.5*IQR(nUMI)) | nUMI > (get_q3(nUMI) + 1.5 * IQR(nUMI)))
+  nGene_out = which(nGene < (get_q1(nGene) - 1.5*IQR(nGene)) | nGene > (get_q3(nGene) + 1.5 * IQR(nGene)))
+  
+  discardCells = union(names(nUMI_out),names(nGene_out))
+  return(discardCells)
+}
+
+# get names of cells to DISCARD
+toDISCARD = lapply(seur_unfilt,find_outliers)
+```
+
+
+### Filtering cells on MERGED dataset
+Used the following filtering parameters:
+* cells are not outliers
+* cells meet minimum threshhold for UMI and Feature count
+  * 500 <= nCount_RNA 
+  * 300 <= nFeature_RNA 
+* complexity score >= 0.85
+* ratio_mt <= 0.15
+```{r initial filtering, include=T}
+# create cell ids column
+seur_unfilt = lapply(seur_unfilt, function(x){
+  x$cell_ids = colnames(x)
+  return(x)
+})
+
+# need function for map2 to work within subset function
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+# subset cells
+seur_filt = map2(seur_unfilt, toDISCARD, ~ subset(.x, subset = (nCount_RNA >= 500) &
+                                                    (nCount_RNA <= 50000) &
+                                                    (cell_ids %!in% .y) &
+                                                    (log10Genes_per_UMI >= 0.85) &
+                                                    (ratio_mt <= 0.15)))
+```
+
+Number of cells before and after initial filtering:
+```{r nCells, include=T}
+# create tibble for plotting, ncol = cells, nrow = features
+df1 = tibble(count = sapply(seur_unfilt,ncol),
+             filt = "Before",
+             LN_ID = ln_id)
+
+df2 = tibble(count = sapply(seur_filt,ncol),
+             filt = "After",
+             LN_ID = ln_id)
+
+# plot
+# TO DO: add text above
+bind_rows(df1,df2) %>%
+  mutate(filt = factor(filt, levels = c("Before","After"))) %>%
+  ggplot(., aes(LN_ID, count, fill = filt)) + 
+  geom_bar(stat = "summary",
+           position="dodge") +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Filtering based on RNA library", y = "nCells", fill = "Filtered", x = NULL)
+
+ggsave("./01_QC/figs/01_rnaFilt_summary.png",width=5,height = 3)
+```
+Before downstream steps (ie: normalization, scaling, annotation, actual analysis, etc), need to QC cells based on ATAC seq by using ArchR. 
+Afterwards, cells/barcodes that are still present after filtering each modality individual will be used for next steps.
+```{r save rds, include=F}
+saveRDS(seur_filt, "./01_QC/rds/01_seur_filt.rds")
+```
+
