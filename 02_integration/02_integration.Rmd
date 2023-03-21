@@ -30,7 +30,7 @@ use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
 
 ```{r data import}
 ln_id = c("LN0025","LN0177","LN0193","LN0438")
-sct_list = qread("01_QC/rds/04_split_sct.qs")
+sct_list = qread("01_QC/rds/04_split_sct_noCCreg.qs")
 atac_list = qread("02_integration/rds/01_atac_seurat.qs")
 ```
 
@@ -74,7 +74,7 @@ atac_meta = lapply(atac_list, function(x) x@meta.data)
 # add metadata, which by default matches the order based on rownames! 
 allModalities = map2(allModalities, atac_meta, ~ AddMetaData(.x,.y))
 
-qsave(allModalities, "02_integration/rds/02_allModalities.qs", nthreads = 16)
+qsave(allModalities, "02_integration/rds/02_allModalities_noCCreg.qs", nthreads = 16)
 ```
 
 
@@ -125,9 +125,9 @@ umap_clusters = DimPlot(sct_integrated, reduction = "sctUMAP", pt.size = 0.25, g
   theme(aspect.ratio = 3/3) +
   labs(title = "RNA - Integrated")
 
-ggsave("02_integration/figs/02_sctUMAP.png", plot = umap, width = 7, height = 6)
-ggsave("02_integration/figs/02_sctUMAP_splitSamples.png", plot = umap_splitSample, width = 14, height = 6)
-ggsave("02_integration/figs/02_sctUMAP_clsuters.png", plot = umap_clusters, width = 7, height = 6)
+ggsave("02_integration/figs/02_sctUMAP_noCCreg.png", plot = umap, width = 7, height = 6)
+ggsave("02_integration/figs/02_sctUMAP_splitSamples_noCCreg.png", plot = umap_splitSample, width = 14, height = 6)
+ggsave("02_integration/figs/02_sctUMAP_clsuters_noCCreg.png", plot = umap_clusters, width = 7, height = 6)
 
 umap 
 umap_splitSample
@@ -137,7 +137,7 @@ Plot marker genes / cluster
 TO DO: make shiny app
 
 https://www.nature.com/articles/s41467-019-12464-3
-```{r violin marker genes sct}
+```{r violin marker genes sct, eval=F}
 DefaultAssay(sct_integrated) = "SCT"
 
 markers = c("MS4A1","CD3D")
@@ -152,8 +152,8 @@ vlnGeneral
 
 ### Save/Load sct_integrated
 ```{r eval = F}
-qsave(sct_integrated, "02_integration/rds/02_sct_integrated.qs", nthreads = 16)
-sct_integrated = qread("02_integration/rds/02_sct_integrated.qs")
+qsave(sct_integrated, "02_integration/rds/02_sct_integrated_noCCreg.qs", nthreads = 16)
+#sct_integrated = qread("02_integration/rds/02_sct_integrated_noCCreg.qs")
 ```
 
 
@@ -319,7 +319,7 @@ cd3d = ggplot(atacumap, aes(atacUMAP_1,atacUMAP_2)) +
   facet_grid(cols = vars(Sample))
 
 ggsave("02_integration/figs/02_atacUMAP_MS4A1.png", ms4a1, width = 10, height = 5)
-ggsave("02_integration/figs/02_atacUMAP_CD3D.png", cd3d, width = 10, height = 5)xs
+ggsave("02_integration/figs/02_atacUMAP_CD3D.png", cd3d, width = 10, height = 5)
 ```
 
 Test w/ doublet score
@@ -375,7 +375,7 @@ sct_atac_combined = FindClusters(sct_atac_combined, algorith = 4, method = "igra
 
 ### Save/Load sct_atac_combined
 ```{r}
-qsave(sct_atac_combined,"02_integration/rds/02_sct_atac_combined.qs",nthreads=16)
+qsave(sct_atac_combined,"02_integration/rds/02_sct_atac_combined_noCCreg.qs",nthreads=16)
 # sct_atac_combined = qread("02_integration/rds/02_sct_atac_combined.qs")
 ```
 
@@ -388,8 +388,8 @@ wnnumap = DimPlot(sct_atac_combined, reduction = "wnnUMAP", label = T) +
 wnnumap_split = DimPlot(sct_atac_combined, reduction = "wnnUMAP", split.by = "Sample") +
   theme(aspect.ratio = 3/3)
 
-ggsave("02_integration/figs/02_wnnUMAP.png",wnnumap, width = 6, height = 6)
-ggsave("02_integration/figs/02_wnnUMAP_splitSample.png",wnnumap_split, width = 16, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_noCCreg.png",wnnumap, width = 6, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_splitSample_noCCreg.png",wnnumap_split, width = 16, height = 6)
 ```
 
 Find B cell clusters
@@ -426,8 +426,8 @@ cd3drna = ggplot(wnn_df, aes(wnnUMAP_1,wnnUMAP_2)) +
         aspect.ratio = 3/3,
         strip.background = element_blank())
 
-ggsave("02_integration/figs/02_wnnUMAP_MS4A1_rna.png",ms4a1rna, width = 16, height = 6)
-ggsave("02_integration/figs/02_wnnUMAP_CD3D_rna.png",cd3drna, width = 16, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_MS4A1_rna_noCCreg.png",ms4a1rna, width = 16, height = 6)
+ggsave("02_integration/figs/02_wnnUMAP_CD3D_rna_noCCreg.png",cd3drna, width = 16, height = 6)
 
 ms4a1rna
 cd3drna

@@ -15,6 +15,7 @@ library(tidyverse)
 library(ggpubr)
 library(tricycle)
 library(shiny)
+library(qs)
 
 # always set seed!
 set.seed(105)
@@ -65,9 +66,6 @@ allGenes = rownames(merged)
 
 # scale
 split_logNorm = lapply(split_logNorm, ScaleData, features=allGenes)
-
-saveRDS(split_logNorm, "01_QC/rds/04_split_logNorm.rds")
-split_logNorm = readRDS("01_QC/rds/04_split_logNorm.rds")
 ```
 
 ### 2. Add cell cycle scores
@@ -80,7 +78,7 @@ Can compare cell cycle scoring
 Also adds cell cycle stages from Schwabe method
 * https://www.embopress.org/doi/full/10.15252/msb.20209946 
 * gene list they used: https://www.molbiolcell.org/doi/10.1091/mbc.02-02-0030
-```{r add cell cycle genes, include=T, messsage=F}
+```{r add cell cycle genes, messsage=F}
 # get seurat gene list
 tirosh_ccGenes = cc.genes.updated.2019
 
@@ -245,7 +243,8 @@ Mitochondrial gene ratio didn't seem to have a huge impact on separating samples
 
 Based on Seurat cell cycle regression tutorial: "we suggest regressing out the difference between the G2M and S phase scores. This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase amongst proliferating cells (which are often uninteresting), will be regressed out of the data."
 
-```{r create new score for regression, include=T}
+For this version, will keep ALL cell cycle scores to try to resolve B cell subclusters. 
+```{r create new score for regression, include=T, eval=F}
 # new cc_diff score for regression
 split_cc = lapply(split_cc, function(seuObj){
   seuObj$cc_diff = seuObj$S.Score - seuObj$G2M.Score
@@ -253,10 +252,11 @@ split_cc = lapply(split_cc, function(seuObj){
 })
 ```
 
-### 4. Regress signals in SCTransform
+### 4. SCTransform
+Keep all proliferation genes to stratify proliferating and non proliferating B cells.
 ```{r regress SCTransform, include=T}
 # regress out cc_diff score, use all genes (residual.features=NULL) to calc residuals
-split_sct = lapply(split_cc, SCTransform, vst.flavor = "v2", vars.to.regress = "cc_diff", residual.features=NULL)
+split_sct = lapply(split_cc, SCTransform, vst.flavor = "v2", residual.features=NULL)
 ```
 
 ### 5. Find Neighbors and Perform Clustering w/ SCT assay only (before addition of ATAC assay)
@@ -292,8 +292,8 @@ split_sct = map(split_sct, ~ .x %>%
                   FindClusters(resolution = seq(0.4,1.15,by = 0.25), verbose = FALSE))
 
 
-qsave(split_sct,"./01_QC/rds/04_split_sct.qs",nthreads = 16)
-#split_sct = qread("./01_QC/rds/04_split_sct.qs")
+qsave(split_sct,"./01_QC/rds/04_split_sct_noCCreg.qs",nthreads = 16)
+#split_sct = qread("./01_QC/rds/04_split_sct_noCCreg.qs")
 ```
 
 Quick visualization of B vs T cells
@@ -302,7 +302,7 @@ BvsT = lapply(split_sct, FeaturePlot, features = (c("MS4A1","PAX5","CD3D","CD3E"
 
 BvsT_sct = ggarrange(plotlist = BvsT, nrow = 1, labels = names(BvsT), vjust = 1)
 
-ggsave("01_QC/figs/04_sctUMAP_BvsT_plot.png", BvsT_sct, width = 36, height = 5)
+ggsave("01_QC/figs/04_sctUMAP_BvsT_plot_noCCreg.png", BvsT_sct, width = 36, height = 5)
 ```
 
 
