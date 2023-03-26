@@ -50,6 +50,7 @@ Subset Seurat and ArchR objects
 seur_keep = subset(seur_flt, subset = (cell_ids %in% keep_ids))
 saveRDS(seur_keep, "./01_QC/rds/03_seur_keep.rds")
 
+# TO DO: use subsetArchRProject() to drop cells in arrow files!
 archR_keep = archR_flt[archR_flt$cellNames %in% keep_ids,]
 saveArchRProject(ArchRProj = archR_keep, 
                              outputDirectory = "01_QC/ArchRproj_keep", 
