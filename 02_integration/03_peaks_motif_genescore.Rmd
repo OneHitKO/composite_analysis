@@ -14,7 +14,7 @@ runtime: shiny
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE,include=T,message=F,eval = F)
+knitr::opts_chunk$set(echo = TRUE,include=T,message=F)
 ```
 
 ```{r libraries, warning=F}
@@ -31,12 +31,15 @@ library(EnsDb.Hsapiens.v86)
 library(MotifDb)
 library(universalmotif)
 library(BSgenome.Hsapiens.UCSC.hg38)
+library(TFBSTools)
+library(BiocParallel)
+library(chromVAR)
 
-# always set seed!!! need to repeat
+# always set seed!!!
 set.seed(105)
 
 options(future.globals.maxSize = 4000 * 1024^2)
-addArchRThreads(threads = 64, force = T)
+addArchRThreads(threads = 125, force = T)
 addArchRGenome("hg38")
 
 # set python
@@ -49,7 +52,7 @@ sct_atac_combined = qread("02_integration/rds/02_sct_atac_combined_noCCreg.qs")
 archR_keep = loadArchRProject("01_QC/ArchRproj_keep/")
 ```
 
-This script uses ArchR wrappers to identify Peaks, Motif Deviations, and Gene Score Activity. These results are then inserted as individual "Assays" into the integrated `Large SeuratObject`.
+This script uses ArchR wrappers to identify Peaks, impute weights, Motif Deviations, and Gene Score Activity. These results are then inserted as individual "Assays" into the integrated `Large SeuratObject`.
 
 ## Peak calling using MACS2
 
@@ -57,7 +60,7 @@ Liked ArchR's iterative peak overlap process on fixed with peaks, which prevents
 
 Need to first create an ArchR project with all samples/cells, and add cluster assignment and wnn embedding.
 
-```{r addCluster, eval = F}
+```{r addCluster}
 # check if cell order is the same
 all(archR_keep$cellNames == sct_atac_combined$cell_ids)
 
@@ -72,10 +75,9 @@ meta = meta[ord,]
 archR_keep$wnn.cluster = meta$wsnn_res.0.8
 
 # add wnn embedding
-wnnUMAP = as_tibble(Embeddings(sct_atac_combined, reduction = "wnnUMAP"),
-                    rownames = "CellIDs")
+wnnUMAP = Embeddings(sct_atac_combined, reduction = "wnnUMAP")
 
-# reorder rownames to match archr proj
+# reorder rownames (same as original seurat@meta.data) to match archr proj
 wnnUMAP = wnnUMAP[ord,]
 
 # rename rows and cols to be consistent w archr
@@ -90,26 +92,27 @@ allLN = saveArchRProject(ArchRProj = archR_keep,
                          load = T)
 ```
 
-```{r loadArchrProj}
+```{r loadArchrProj, eval=F}
 allLN = loadArchRProject("02_integration/allLN_ArchR")
 ```
 
 Call peaks using macs2 on pseudobulked replicates of wnn clusters identified in Seurat.
 
-```{r callPeaks, eval=F}
+```{r callPeaks}
 h5disableFileLocking()
 
 # get pseudobulk clusters
 allLN = addGroupCoverages(
   ArchRProj = allLN, 
   groupBy = "wnn.cluster", 
-  threads = 64,
+  threads = 125,
   force = T
 )
 
 h5enableFileLocking()
 
-# call peaks; next time do min cells = 50
+# call peaks
+## TO DO: next time do min cells = 50
 allLN = addReproduciblePeakSet(
   ArchRProj = allLN,
   minCells = 25,
@@ -165,16 +168,16 @@ tfsOfI = c("PAX5","TCF7","BCL6","IRF8","IRF4","FOX")
 
 tfsInJaspar = names(jaspar2022)[grep(str_c(tfsOfI, collapse = "|"), names(jaspar2022))]
 
-tfsInHoco = names(hocomocoV10)[grep(str_c(tfsOfI, collapse = "|"), names(hocomocoV10))]
+tfsInHoco = names(hocomocoV11)[grep(str_c(tfsOfI, collapse = "|"), names(hocomocoV11))]
 
 sort(tfsInJaspar)
 sort(tfsInHoco)
 ```
 
-Both seem to cover (super brief list of) TFs in interest. There are differences in the PFM however. \
+Both seem to cover (super brief list of) TFs in interest. There are differences in the PFM however.\
 Example: FOXP3
 
-```{r FOXP3pfm}
+```{r FOXP3pfm, eval=F}
 # example: FOXP3 PFM in jaspar
 jaspar2022[[grep("-FOXP3-",names(jaspar2022))]]
 
@@ -188,9 +191,6 @@ Want to include both lists because of these differences. First tidied names of e
 
 -   ex: "Hsapiens-jaspar2022-PPARG-MA0066.1"
 
-```{=html}
-<!-- -->
-```
 -   `<TF name>`-`<BaseID, starts with MA>`.`<version>`
 
 -   MatrixID of the TF = \<BaseID\>.\<version\>
@@ -213,7 +213,7 @@ Want to include both lists because of these differences. First tidied names of e
 
 -   Rank: "Since v11 the alternative binding models of a particular TF are ranked from 0 (the primary model) to 1 and 2 (the alternative models, including single-box variants). The models of 0 rank is the most 'general' variant with the best weighted performance in the cross-validation benchmark (see the HOCOMOCO paper for details)."
 
-```{r finalMotifList, warning=F}
+```{r finalMotifList}
 # tidy jaspar, want TF-unique/matID_db
 ## use different separators, easier to separate later for plotting, etc
 names(jaspar2022) = gsub("Hsapiens.*jaspar2022-","",names(jaspar2022)) %>% 
@@ -239,10 +239,13 @@ finalMotif = c(jaspar2022,hoco_ABC)
 qsave(finalMotif, "02_integration/rds/03_finalMotif.qs", nthreads = 16)
 ```
 
+```{r loadpwm, eval=F}
+finalMotif = qread("02_integration/rds/03_finalMotif.qs")
+```
+
 ### Motif Annotation
 
 Annotate peaks with motifs contained in PWM list.
-
 ```{r peakAnno}
 # convert to PWM
 finalPWM = convert_motifs(finalMotif, class = "TFBSTools-PWMatrix")
@@ -254,18 +257,62 @@ allLN = addMotifAnnotations(allLN,
                             motifPWMs = finalPWM,
                             motifSet = NULL,
                             collection = NULL,
-                            annoName = "motif",
-                            force = T)
+                            annoName = "Motif",
+                            force = F)
+
+# add background peaks
+allLN = addBgdPeaks(allLN)
+
+# save project
+allLN = saveArchRProject(ArchRProj = allLN,
+                         outputDirectory ="02_integration/allLN_ArchR", 
+                         load = T)
 
 ```
 
 ### ChromVAR
 
-## Gene score activity with combined cells
+Add motif deviation score to ArchR project.
 
-## Adding data to integrated Seurat Object
+Note: the Signac/Seurat wrapper is NOT very good! would need to use BiocParallel and/or submit to hpc.
+TO DO: REPEAT when more space on seneca, or submit to cluster?! 
 
-```{r create chromatin assay, eval=F}
+```{r chromvar}
+# add deviations
+allLN = addDeviationsMatrix(ArchRProj = allLN, 
+                            peakAnnotation = "Motif",
+                            threads = 1,
+                            force = T)
+
+# save project! 
+allLN = saveArchRProject(ArchRProj = allLN,
+                         outputDirectory ="02_integration/allLN_ArchR", 
+                         load = T)
+```
+
+```{r eval=F}
+allLN = loadArchRProject("02_integration/allLN_ArchR")
+```
+
+Test plotting
+
+```{r eval=F}
+wnnUMAP = getEmbedding(allLN,"wnnUMAP")
+
+plotEmbedding(allLN,
+              embedding = "wnnUMAP",
+              colorBy = "motifMatrix",
+              name = c("z:PAX6-H11MO.0.C_hocoV11","z:IRF8-H11MO.0.B_hocoV11"))
+```
+
+## TO DO: Gene score activity with combined cells
+
+
+## Integrating data to Seurat Object
+FYI: Cells do not need to be reordered to be added into Seurat obj!
+
+### Adding Peaks
+```{r createChromatinAssay, eval=F}
 # get SE
 peakSE = getMatrixFromProject(allLN,"PeakMatrix")
 
@@ -273,7 +320,7 @@ peakSE = getMatrixFromProject(allLN,"PeakMatrix")
 peakMat = assay(peakSE)
 colnames(peakMat) = gsub("#","_",colnames(peakMat))
 
-# get ranges of peaks
+# get ranges of peaks; idx is index of chr
 peakRanges = granges(peakSE)
 
 # get metadata to add to seurat metadata (ie: Frac Reads in Peaks)
@@ -289,18 +336,14 @@ hg38_anno = ArchRtoSignac::getAnnotation(reference = EnsDb.Hsapiens.v86,
 peakAssay = CreateChromatinAssay(counts = peakMat,
                                  ranges = peakRanges,
                                  genome = "hg38",
-                                 min.cells = 50,
+                                 min.cells = 0,
                                  annotation = hg38_anno,
                                  validate.fragments = F)
 
 peakAssay@meta.features = as.data.frame(data)
-```
 
-FYI: Cells do not need to be reordered to be added into Seurat obj!
-
-```{r addpeaks}
-# add "PEAK" assay to seurat obj (to do: rename other assay to "TILE"?)
-sct_atac_combined[["PEAKS"]] = peakAssay
+# add "peaks" assay to seurat obj (TO DO: rename other assay to "tile"?)
+sct_atac_combined[["peaks"]] = peakAssay
 
 # remove redundant columns before adding to metadata
 data = data[, colnames(data) %ni% c("Sample","wnn.cluster")]
@@ -312,11 +355,76 @@ data = data[ord,]
 
 # add to metadata
 sct_atac_combined@meta.data = cbind(sct_atac_combined@meta.data, data)
+```
+### Adding motif data to peaks assay
+```{r addMotifObject, eval=F}
+# get peak annotation info from ArchR project
+peakAnno = getPeakAnnotation(allLN, "Motif")
+
+# get granges list of motif positions
+positions = readRDS(peakAnno$Positions)
+
+# get motif info in peaks
+matchesSE = readRDS(peakAnno$Matches)
+
+# get binarized matrix of peaks (rows) vs motif (cols)
+motifMat = assay(matchesSE)
+
+# rename rownames
+rownames(motifMat) = GRangesToString(matchesSE@rowRanges)
+
+# get granges containing metadata of peakset; previously checked if same as peakRanges
+peakMetadata = as.data.frame(matchesSE@rowRanges, row.names = GRangesToString(matchesSE@rowRanges))
+
+# create motif object
+motifObj = CreateMotifObject(
+  data = motifMat,
+  pwm = allLN@peakAnnotation$Motif$motifs,
+  motif.names = names(allLN@peakAnnotation$Motif$motifs),
+  positions = positions,
+  meta.data = peakMetadata
+)
+
+# add motif object to peaks seurat object
+DefaultAssay(sct_atac_combined) = "peaks"
+Motifs(sct_atac_combined) = motifObj
 
 # save and analyze in separate script
 qsave(sct_atac_combined,"02_integration/rds/03_sct_atac_combined.qs", nthreads = 64)
 ```
 
-```{r addmotifs}
+### Adding chromvar assay to seurat object
+```{r addchromvar}
+# get chromvar data
+motifDevSE = getMatrixFromProject(allLN, "MotifMatrix", verbose = F)
+motifDevMat = assay(motifDevSE)
+colnames(motifDevMat) = gsub("#","_",colnames(motifDevMat))
+
+# get motif metadata, though not needed here
+motifDevMetadata = finalMotif@elementMetadata
+
+# create seurat obj
+sct_atac_combined[["chromVAR"]] = CreateAssayObject(data = motifDevMat)
+
+# save and analyze in separate script
+qsave(sct_atac_combined,"02_integration/rds/03_sct_atac_combined.qs", nthreads = 64)
+```
+
+test plot
+```{r}
+DefaultAssay(sct_atac_combined) = "chromVAR"
+
+FeaturePlot(
+  object = sct_atac_combined,
+  features = "PAX5-H11MO.0.A-hocoV11",
+  pt.size = 0.1,
+  min.cutoff = "q10",
+  max.cutoff = "q90",
+  reduction = "wnnUMAP"
+) + 
+  theme(aspect.ratio = 3/3) + 
+  scale_color_viridis_c(option = "plasma")
 
 ```
+
+
