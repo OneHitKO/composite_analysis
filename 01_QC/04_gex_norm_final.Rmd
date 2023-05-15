@@ -6,34 +6,32 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, include=T, message=F)
+knitr::opts_chunk$set(echo = TRUE, include=T, warning = F, message=F, eval=F)
 ```
 
-```{r setup, warning=F, include=F}
+```{r libraries, include=F}
 library(Seurat)
 library(tidyverse)
 library(ggpubr)
 library(tricycle)
 library(shiny)
+library(clustree)
 library(qs)
+library(reticulate)
 
 # always set seed!
 set.seed(105)
 
 options(future.globals.maxSize = 4000 * 1024^2)
+
+# set python
+use_python("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env/bin")
+use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
 ```
 
-## Normalization
-Test 2 different approaches of normalization BEFORE merging data sets: 1. log-normalize/scale vs 2. SCTransform. This preprint demonstrated that normalization before merging always outperforms normalization after merging (https://www.biorxiv.org/content/10.1101/2021.08.18.456898v1.full.pdf, figure 5). 
-
-Additional notes on when to merge datasets (before/after SCTransform):
-https://www.biostars.org/p/9516696/
-https://satijalab.org/seurat/articles/integration_introduction.html
-
-### Import and split merged Seurat object
-Object was merged during filtering to match cells kept after QC step in ATAC-seq.
-```{r split}
+```{r splitSeuratObj}
 # import
+# object was merged during filtering to match cells kept after QC step in ATAC-seq
 merged = readRDS("./01_QC/rds/03_seur_keep.rds")
 merged_meta = merged@meta.data
 
@@ -42,60 +40,103 @@ merged$Sample = gsub("#.*","",merged$cell_ids)
 split_seur = SplitObject(merged, split.by = "Sample")
 ```
 
-### 1. Normalizing/scaling genes prior to adding cell cycle scores
-Want to determine whether cell cycle genes and/or mt ratio explain unwanted variation. In order to do so, gene counts are normalized prior to adding scores. 
+### Goals:
 
-TO DO: 
-Log-norm explanation:
+-   Perform 2 different approaches of normalization, both BEFORE merging
+    data sets:
+    -   log-normalize/scale
+    -   SCTransform
+-   This preprint demonstrated that normalization before merging always
+    outperforms normalization after merging
+    (<https://www.biorxiv.org/content/10.1101/2021.08.18.456898v1.full.pdf>,
+    figure 5).
+-   Additional notes on when to merge datasets (before/after
+    SCTransform):
+    -   <https://www.biostars.org/p/9516696/>
+    -   <https://satijalab.org/seurat/articles/integration_introduction.html>
 
-Scaling (from Seurat vignette): 
-* Shifts the expression of each gene, so that the mean expression across cells is 0
-* Scales the expression of each gene, so that the variance across cells is 1
-* This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
-* The results of this are stored in pbmc[["RNA"]]@scale.data
+## 1. Log-Normalizing & Scaling RNA counts
 
-```{r log-norm and scale}
+-   Normalization (from Seurat vignette):
+    -   normalizes the feature expression measurements for each cell by
+        the total expression, multiplies this by a scale factor (10,000
+        by default), and log-transforms the result
+-   Scaling (from Seurat vignette):
+    -   Shifts the expression of each gene, so that the mean expression
+        across cells is 0
+    -   Scales the expression of each gene, so that the variance across
+        cells is 1
+    -   Can regress out variables here! Just like in SCTransform
+    -   This step gives equal weight in downstream analyses, so that
+        highly-expressed genes do not dominate
+    -   The results of this are stored in `pbmc[["RNA"]]@scale.data`
+-   Perform prior to adding cell cycle scores to see cell cycle genes
+    (and/or other features like mt ratio) explain unwanted variation
+
+```{r logNorm}
+# get seurat gene list
+ccGenes = cc.genes.updated.2019
+
 # normalize and find variable features
-split_logNorm = lapply(split_seur, FUN = function(x) {
-    x = NormalizeData(x, normalization.method = "LogNormalize", scale.factor = 10000) # default
-    x = FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+split_logNorm = lapply(split_seur, FUN = function(x){
+    x = NormalizeData(x, 
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 10000, # default
+                      verbose = F) 
+    
+    # do before scaling
+    x = FindVariableFeatures(x, 
+                             selection.method = "vst", 
+                             nfeatures = 2000,
+                             verbose = F)
+    
+    x = ScaleData(x, 
+                  features = allGenes,
+                  verbose = F)
+    
+    return(x)
 })
-
-# get name of all genes
-allGenes = rownames(merged)
-
-# scale
-split_logNorm = lapply(split_logNorm, ScaleData, features=allGenes)
 ```
 
-### 2. Add cell cycle scores
-Multiple gene lists exist for cell cycle scoring. Seurat uses a list generated from Tirosh, et al (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4944528/) to separate S genes from G2M genes. 
+### Adding cell cycle scores
 
-Other packages like `tricycle` (https://bioconductor.org/packages/release/bioc/html/tricycle.html) uses a different gene list that can separate more cell cycle phases. 
-Can compare cell cycle scoring
-* "users can approximately relate 0.5pi to be the start of S stage, pi to be the start of G2M stage, 1.5pi to be the middle of M stage, and 1.75pi-0.25pi to be G1/G0 stage."
+-   After normalizing counts, can add cell cycle score multiple ways
+-   Seurat uses a list generated from Tirosh, et al to separate S genes
+    from G2M
+    genes:(<https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4944528/>)
+-   Other packages like `tricycle`
+    (<https://bioconductor.org/packages/release/bioc/html/tricycle.html>)
+    uses a different gene list that can separate more cell cycle phases.
+    Can compare cell cycle scoring \* "users can approximately relate
+    0.5pi to be the start of S stage, pi to be the start of G2M stage,
+    1.5pi to be the middle of M stage, and 1.75pi-0.25pi to be G1/G0
+    stage."
+-   Also adds cell cycle stages from Schwabe method
+    <https://www.embopress.org/doi/full/10.15252/msb.20209946>
+    -   gene list they used:
+        <https://www.molbiolcell.org/doi/10.1091/mbc.02-02-0030>
 
-Also adds cell cycle stages from Schwabe method
-* https://www.embopress.org/doi/full/10.15252/msb.20209946 
-* gene list they used: https://www.molbiolcell.org/doi/10.1091/mbc.02-02-0030
-```{r add cell cycle genes, messsage=F}
-# get seurat gene list
-tirosh_ccGenes = cc.genes.updated.2019
-
+```{r addCellCycleGenes, messsage=F, warning=F}
 # add score, which is similar to AddModuleScore()
-split_cc = lapply(split_logNorm, CellCycleScoring, g2m.features = tirosh_ccGenes$g2m.genes, s.features = tirosh_ccGenes$s.genes)
+split_logNorm = map(split_logNorm, ~ CellCycleScoring(.x,
+                                                      g2m.features = ccGenes$g2m.genes,
+                                                      s.features = ccGenes$s.genes))
 
 # also add tricycle score
 # create function
 add_tri = function(seu_obj){
   # get data of active assay
-  normCounts = GetAssayData(seu_obj,slot = "data")
+  normCounts = GetAssayData(seu_obj, slot = "data")
   
   # phases are determined by multiples of pi from tricycle method
-  tricycle_phases = estimate_cycle_position(normCounts, gname.type = "SYMBOL",species = "human")
+  tricycle_phases = estimate_cycle_position(normCounts, 
+                                            gname.type = "SYMBOL",
+                                            species = "human")
   
-  # implementation of Schwabe method using RevelioGeneList (see function for more details)
-  schwabe_phases = estimate_Schwabe_stage(normCounts, gname.type = "SYMBOL",species = "human")
+  # implementation of Schwabe method using RevelioGeneList (see fxn for more details)
+  schwabe_phases = estimate_Schwabe_stage(normCounts, 
+                                          gname.type = "SYMBOL",
+                                          species = "human")
   
   # add to metadata of seuObj
   seu_obj$tricycle = tricycle_phases
@@ -105,55 +146,65 @@ add_tri = function(seu_obj){
 }
 
 # add other cell cycle scores
-split_cc  = lapply(split_cc,add_tri)
+split_logNorm  = lapply(split_logNorm, add_tri)
 ```
 
-### 3. PCA Analysis
-* Determine maximum number of PCs to use for clustering
-* Determine features that explain the most variance along a PC (loadings)
-* Determine if certain covariates (mt ratio, cell cycle, etc) explain variation along top PCs. 
+### PCA Analysis
 
-More info: https://hbctraining.github.io/scRNA-seq/lessons/elbow_plot_metric.html
-https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_SC_SCT_normalization.md
+-   Determine dimensionality of data and maximum number of PCs to use
+    for clustering
+-   Determine features that explain the most variance along a PC
+    (loadings)
+-   Determine if certain covariates (mt ratio, cell cycle, etc) explain
+    variation along top PCs
+    -   These can be regressed out during scaling! (or during
+        SCTransform)
+-   More info:
+    <https://hbctraining.github.io/scRNA-seq/lessons/elbow_plot_metric.html>
+    <https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/06_SC_SCT_normalization.md>
 
-TO DO: need to add pca_rna label since will repeat pca w/ SCT count matrix
-```{r pca, include=T}
+```{r rnaPCA}
 # run PCA, might need to increase # pcs (npcs) later
-split_cc = lapply(split_cc, RunPCA, npcs = 30, verbose = F)
-```
+split_logNorm = map(split_logNorm, ~ RunPCA(.x,
+                                            npcs = 30,
+                                            reduction.name = "rnaPCA",
+                                            verbose = F)) 
 
-Determine dimensionality of data, and get % variance explained by each PC.
-```{r dimen, include=T}
 # create function to get % explained variance (returns vector)
 # can also use to label PCA axes
 get_pctVar = function(seuObj){
-  pct = seuObj[["pca"]]@stdev / sum(seuObj[["pca"]]@stdev) * 100
+  pct = seuObj[["rnaPCA"]]@stdev / sum(seuObj[["rnaPCA"]]@stdev) * 100
   return(pct)
 }
 
-pcVar = lapply(split_cc,get_pctVar)
+pcVar = lapply(split_logNorm, get_pctVar)
 
 # get cumulative sums to quantitatively determine dimensionality
 cumsum = lapply(pcVar, cumsum)
 
-# determine the first PC that has cum variance of 90%, but explains less than 5% (use for ) 
+# determine the first PC that has cum variance of 90% & explains < 5% total variance
+# this determines dimensionality of data
 whichPC = map2(pcVar,cumsum, ~ which(.y > 90 & .x < 5)[1])
 whichPC
 ```
+
 TO DO: add scree/elbow plot
-```{r scree, include=T}
+
+```{r scree}
 
 ```
 
-```{r data reformat, include=T}
+### Plot PCA
+
+```{r pcaEmbeddings}
 # get pca embeddings
-pcaEmbeds = lapply(split_cc, function(seuObj){
-  seuObj[["pca"]]@cell.embeddings %>%
+pcaEmbeds = lapply(split_logNorm, function(seuObj){
+  seuObj[["rnaPCA"]]@cell.embeddings %>%
     as_tibble(rownames = "cellID")
   })
 
 # get metadata
-meta = lapply(split_cc, function(seuObj){
+meta = lapply(split_logNorm, function(seuObj){
   seuObj@meta.data %>%
     as_tibble(rownames = "cellID") %>%
     select(!c("cell_ids","Sample","orig.ident"))
@@ -166,12 +217,14 @@ pcaEmbeds = map2(pcaEmbeds, meta, ~ left_join(.x, .y, by = "cellID"))
 color_by = colnames(pcaEmbeds[[1]])[!grepl("PC_|cellID",colnames(pcaEmbeds[[1]]))]
 ```
 
-
-TO DO: add % variation explained by PC to axis
+TO DO: create better functions, add % variation explained by PC to axis
 in pcVar object
-```{r pca shiny, include=T}
+
+TO DO: correlate features to PC components!
+
+```{r shinyPCA}
 ui = fluidPage(
-  titlePanel("PCA, pre SCTransformed"),
+  titlePanel("PCA, log-normalized and scaled counts"),
   sidebarLayout(
     
     # what to include in side panel
@@ -200,6 +253,7 @@ ui = fluidPage(
 )
 
 serv = function(input, output){
+  
   # ggplot fxn 
   plotPCA = function(df){
     ggplot(df, aes_string(input$x_PC,input$y_PC)) +
@@ -238,32 +292,174 @@ serv = function(input, output){
 shinyApp(ui = ui, server = serv)
 ```
 
-Seems like cells do separate based on cell cycle / tricycle scores (PCs 3 and 4, ~ 5% total variation).
-Mitochondrial gene ratio didn't seem to have a huge impact on separating samples, but it could be because of previous filtering steps (cutoff = 0.15, maybe too strict?).
+**Based on PCA results:**
 
-Based on Seurat cell cycle regression tutorial: "we suggest regressing out the difference between the G2M and S phase scores. This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase amongst proliferating cells (which are often uninteresting), will be regressed out of the data."
+-   Seems like cells do separate based on cell cycle / tricycle scores
+    (PCs 3 and 4, \~ 5% total variation)
+-   Mitochondrial gene ratio didn't seem to have a huge impact on
+    separating samples, but it could be because of previous filtering
+    steps (cutoff = 0.15, maybe too strict?).
+-   Seurat cell cycle regression recommendation: "we suggest regressing
+    out the difference between the G2M and S phase scores. This means
+    that signals separating non-cycling cells and cycling cells will be
+    maintained, but differences in cell cycle phase amongst
+    proliferating cells (which are often uninteresting), will be
+    regressed out of the data."
+-   **For this version, will keep ALL cell cycle scores to try to
+    resolve B cell subclusters.**
 
-For this version, will keep ALL cell cycle scores to try to resolve B cell subclusters. 
-```{r create new score for regression, include=T, eval=F}
-# new cc_diff score for regression
-split_cc = lapply(split_cc, function(seuObj){
+```{r S.G2M.score, include=F}
+# new cc_diff score for sct regression
+split_logNorm = lapply(split_logNorm, function(seuObj){
   seuObj$cc_diff = seuObj$S.Score - seuObj$G2M.Score
   return(seuObj)
 })
 ```
 
-### 4. SCTransform
-Keep all proliferation genes to stratify proliferating and non proliferating B cells.
-```{r regress SCTransform, include=T}
-# regress out cc_diff score, use all genes (residual.features=NULL) to calc residuals
-split_sct = lapply(split_cc, SCTransform, vst.flavor = "v2", residual.features=NULL)
+### TO DO: Rescaling data with variable regression
+
+-   if you want to regress out variables in future (ratio_mt or cc_diff
+    score), repeat `ScaleData()` with `variables.to.regress` parameter
+    here
+-   need to repeat PCA if so!!
+
+### UMAP Reduction
+
+-   create `rnaUMAP` umap embedding from log-normalized and scaled RNA
+    counts (will also create `sctUMAP` later with SCTransfrom normalized
+    RNA counts
+-   use clustree to identify optimal resolution for clustering
+
+```{r pcaUMAP}
+# run UMAP
+split_logNorm = map(split_logNorm, ~ RunUMAP(.x,
+                                             reduction.name = "rnaUMAP",
+                                             reduction.key = "rnaUMAP_",
+                                             reduction = "rnaPCA",
+                                             dims = 1:26,
+                                             verbose = F))
 ```
 
-### 5. Find Neighbors and Perform Clustering w/ SCT assay only (before addition of ATAC assay)
-First redo PCA. 
-```{r sc clustering, include = T}
-# redo PCA w/ SCT assay, then find dimensionality
-split_sct = lapply(split_sct, RunPCA, npcs = 30, verbose = F, reduction.name = "sctPCA", reduction.key = "sctPC_")
+### Clustering
+
+-   use `clustree` program to identify optimal resolution
+-   one node with multiple incoming edges means data is over-clustered
+
+```{r lognorm.clustering, out.width="50%", out.height="50%"}
+# find neighbors
+split_logNorm = map(split_logNorm, ~ FindNeighbors(.x, 
+                                                   reduction = "rnaPCA",
+                                                   dims = 1:26,
+                                                   verbose = F))
+
+# find appropriate resolution using leiden clustering
+test_tree = map(split_logNorm, ~ FindClusters(.x,
+                                              resolution = seq(0.25, 1.75, by = 0.25),
+                                              algorithm = "4",
+                                              method = "igraph", 
+                                              random.seed = 1,
+                                              verbose = F))
+
+# plot to see which resolution is the best
+lapply(1:4, FUN = function(x){
+  # get metadata w/ cluster info
+  df = test_tree[[x]]@meta.data
+  
+  # speficy columns with cluster info
+  clustree(df, prefix = "RNA_snn_res.")+
+    labs(title = names(test_tree)[[x]])
+})
+```
+
+**Resolution based off of Clustree analysis:**
+
+-   LN0025: 1
+-   LN0177: 1.5
+-   LN0193: 1.75
+-   LN0438: 1 (or 0.75?)
+
+Repeat clustering
+
+```{r final.cluster.lognorm}
+# based off of clustree
+res = c(1,1.5,1.75,1)
+
+# repeat clustering
+split_logNorm = map2(split_logNorm, res, 
+                     ~ FindClusters(.x,
+                                    resolution = .y,
+                                    algorithm = "4",
+                                    method = "igraph",
+                                    random.seed = 1,
+                                    verbose = F))
+```
+
+### Plot UMAP from log-normalized RNA
+
+```{r plot.rnaUMAP}
+# quick plot
+rnaUMAP = lapply(1:4, FUN = function(x){
+  DimPlot(split_logNorm[[x]], 
+          reduction = "rnaUMAP", 
+          group.by = paste0("RNA_snn_res.",res[[x]]),
+          pt.size = 0.05,
+          label.size = 3,
+          label = T) +
+    theme(aspect.ratio = 3/3, 
+          legend.position = "none") +
+    labs(title = names(split_logNorm)[[x]])
+})
+
+rnaUMAP = ggarrange(plotlist = rnaUMAP)
+
+ggsave("01_QC/figs/04_rnaUMAP_noCCreg.png",rnaUMAP)
+
+rnaUMAP
+```
+
+```{r plot.rnaUMAP.ms4a1}
+# quick plot
+rnaUMAP_ms4a1 = lapply(1:4, FUN = function(x){
+  FeaturePlot(split_logNorm[[x]], 
+              features = "MS4A1",
+              slot = "data",
+              reduction = "rnaUMAP",
+              pt.size = 0.05,
+              label = F) +
+    theme(aspect.ratio = 3/3) +
+    labs(title = names(split_logNorm)[[x]])
+})
+
+rnaUMAP_ms4a1 = ggarrange(plotlist = rnaUMAP_ms4a1)
+
+ggsave("01_QC/figs/04_rnaUMAP_ms4a1_noCCreg.png",rnaUMAP_ms4a1)
+
+rnaUMAP_ms4a1
+```
+
+## 2. Normalize by SCTransform
+
+-   In this version, did NOT regress out any variable
+-   "SCT" assay is added to seurat object. log-normalized RNA can still
+    be accessed in "RNA" assay
+
+```{r SCTransform}
+# DID NOT regress out cc_diff score
+#use all genes (residual.features=NULL) to calc residuals
+split_sct = map(split_logNorm, ~ SCTransform(.x,
+                                             vst.flavor = "v2",
+                                             residual.features = NULL))
+```
+
+### PCA analysis with SCTransformed counts
+
+```{r sctPCA}
+# redo PCA w/ SCT assay
+split_sct = map(split_sct, ~ RunPCA(.x,
+                                    npcs = 30,
+                                    reduction.name = "sctPCA",
+                                    reduction.key = "sctPC_",
+                                    verbose = F))
 
 # see % variance for each pc in sctPCA dimen reduc obj
 sct_pcVar = lapply(split_sct, function(seuObj){
@@ -279,30 +475,109 @@ whichPC = map2(sct_pcVar, sct_cumsum, ~ which(.y > 90 & .x < 5)[1])
 whichPC
 ```
 
-Use the pcs 1-26 for dimensional reduction. 
-```{r sc umap, include=T}
-# run UMAP
-split_sct = lapply(split_sct, RunUMAP, reduction.name = "sctUMAP", reduction.key = "sctUMAP_", 
-                   reduction = "sctPCA", dims = 1:26, verbose = FALSE)
+### sctUMAP
 
+-   use "sctPCA" and dims 1:26
 
+```{r sctUMAP}
+split_sct = map(split_sct, ~ RunUMAP(.x,
+                                     reduction.name = "sctUMAP",
+                                     reduction.key = "sctUMAP_",
+                                     reduction = "sctPCA",
+                                     dims = 1:26,
+                                     verbose = F))
+```
+
+### Clustering with sctPCA
+
+```{r sct.clustering, include=T}
 # find neighbors and clusters for visualization, use different resolutions
-split_sct = map(split_sct, ~ .x %>%
-                  FindNeighbors(reduction = "sctPCA", dims = 1:26, verbose = FALSE) %>%
-                  FindClusters(resolution = seq(0.4,1.15,by = 0.25), verbose = FALSE))
+split_sct = map(split_sct, ~ FindNeighbors(.x,
+                                           reduction = "sctPCA", 
+                                           dims = 1:26,
+                                           verbose = FALSE))
 
+# find appropriate resolution using leiden clustering
+# make sure default assay is SCT! 
+test_tree2 = map(split_sct, ~ FindClusters(.x,
+                                           resolution = seq(0.25, 1.75, by = 0.25),
+                                           algorithm = "4",
+                                           method = "igraph", 
+                                           random.seed = 1,
+                                           verbose = F))
+
+# plot to see which resolution is the best
+lapply(1:4, FUN = function(x){
+  # get metadata w/ cluster info
+  df = test_tree2[[x]]@meta.data
+  
+  # speficy columns with cluster info
+  clustree(df, prefix = "SCT_snn_res.")+
+    labs(title = names(test_tree2)[[x]])
+})
+```
+
+**Resolution results of Clustree**
+
+-   LN0025: 0.75 (1?)
+-   LN0177: 0.5 (0.75?)
+-   LN0193: 1
+-   LN0438: 0.75
+
+```{r final.cluster.sct}
+# based off of clustree
+res2 = c(0.75,0.5,1,0.75)
+
+# repeat clustering
+split_sct = map2(split_sct, res2, ~ FindClusters(.x,
+                                                 resolution = .y,
+                                                 algorithm = "4",
+                                                 method = "igraph",
+                                                 random.seed = 1,
+                                                 verbose = F))
 
 qsave(split_sct,"./01_QC/rds/04_split_sct_noCCreg.qs",nthreads = 16)
-#split_sct = qread("./01_QC/rds/04_split_sct_noCCreg.qs")
 ```
 
-Quick visualization of B vs T cells
-```{r include=T}
-BvsT = lapply(split_sct, FeaturePlot, features = (c("MS4A1","PAX5","CD3D","CD3E")))
+### Plot sctUMAP
 
-BvsT_sct = ggarrange(plotlist = BvsT, nrow = 1, labels = names(BvsT), vjust = 1)
+```{r plot.sctUMAP}
+# quick plot
+sctUMAP = lapply(1:4, FUN = function(x){
+  DimPlot(split_sct[[x]], 
+          reduction = "sctUMAP", 
+          group.by = paste0("SCT_snn_res.",res2[[x]]),
+          pt.size = 0.05,
+          label.size = 3,
+          label = T) +
+    theme(aspect.ratio = 3/3, 
+          legend.position = "none") +
+    labs(title = names(split_sct)[[x]])
+})
 
-ggsave("01_QC/figs/04_sctUMAP_BvsT_plot_noCCreg.png", BvsT_sct, width = 36, height = 5)
+sctUMAP = ggarrange(plotlist = sctUMAP)
+
+ggsave("01_QC/figs/04_sctUMAP_noCCreg.png",sctUMAP)
+
+sctUMAP
 ```
 
+```{r plot.sctUMAP.ms4a1}
+# quick plot
+sctUMAP_ms4a1 = lapply(1:4, FUN = function(x){
+  FeaturePlot(split_sct[[x]], 
+              features = "MS4A1",
+              slot = "data",
+              reduction = "sctUMAP",
+              pt.size = 0.05,
+              label = F) +
+    theme(aspect.ratio = 3/3) +
+    labs(title = names(split_sct)[[x]])
+})
 
+sctUMAP_ms4a1 = ggarrange(plotlist = sctUMAP_ms4a1)
+
+ggsave("01_QC/figs/04_sctUMAP_ms4a1_noCCreg.png",sctUMAP_ms4a1)
+
+sctUMAP_ms4a1
+```
