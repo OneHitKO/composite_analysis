@@ -1,0 +1,251 @@
+---
+title: "Integration of ATAC"
+author: "kou"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,include=T,message=F,eval=F, warning=F)
+```
+
+```{r libraries, warning=F}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(shiny)
+library(qs)
+library(reticulate)
+library(clustree)
+
+# always set seed!!! need to repeat
+set.seed(105)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# set python
+use_python("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env/bin")
+use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
+``` 
+
+```{r data_import}
+ln_id = c("LN0025","LN0177","LN0193","LN0438")
+atac_list = qread("02_integration/rds/01_atac_seurat.qs")
+```
+
+## Integrate and batch correct ATAC modalities
+Samples are integrated through their low-dimensional cell embeddings instead of their count matrix of binned genome (reciprocal LSI). Because the binned genome is the same for all samples, the features will be the same. 
+
+More info: https://stuartlab.org/signac/articles/integrate_atac.html
+
+### Preprocessing
+First need to preprocess a little bit and keep ranges of binned genome containing insertion events in at least 50 cells for each sample.
+Furthermore, each sample should have a subset of the *same ranges* to perform dimension reduction.
+
+Notes on sparse matrix slots:https://statisticaloddsandends.wordpress.com/2020/03/31/what-is-a-dgcmatrix-object-made-of-sparse-matrix-format-in-r/
+```{r keep_ranges}
+# get count matrices
+# confirmed that binned ranges are in same order in each file
+count_list = lapply(atac_list, function(x) x@assays$ATAC@counts)
+names(count_list) = ln_id
+
+# get row indices of count table were 
+keepFrags = lapply(count_list, function(sparseM){
+  
+  # binarize the matrix; if there's a value, assign 1
+  sparseM@x[] = T
+  
+  # find which fragments (rows) had insertion events >= 50 cells
+  keepFrags = rownames(sparseM)[rowSums(sparseM) >= 50]
+  
+  return(keepFrags)
+})
+
+# get the union of row indices to subset chromatinAssay
+keepFrags = do.call(c,keepFrags) %>% unique(.)
+
+# subset atac to keep union of features found in >= 50 cells
+new_atac = map(atac_list, ~ DietSeurat(.x,
+                                       features = keepFrags,
+                                       assays = "ATAC",
+                                       dimreducs = c("atacUMAP","iterLSI_4")))
+
+# add gene score activity and cell col identifies
+new_atac = lapply(seq_along(new_atac), function(x){
+  new_atac[[x]][["GeneScoreImputed"]] = atac_list[[x]][["GeneScoreImputed"]]
+  return(new_atac[[x]])
+})
+```
+
+### Create shared low dimesional space "recpricol LSI"
+Because the data is sparse, the samples are integrated through a shared low-dimensional space by "reciprocal LSI" by projecting each dataset into the next dataset's LSI space.
+Therefore, *need to create a shared LSI space by merging all data sets first.* 
+
+More info on integration in Seurat: https://www.sciencedirect.com/science/article/pii/S0092867419305598?via%3Dihubs
+More info on methods to calculate LSI: http://andrewjohnhill.com/blog/2019/05/06/dimensionality-reduction-for-scatac-data/
+```{r merge_data}
+# merge data sets
+merged_atac = merge(new_atac[[1]],
+                    new_atac[2:4], 
+                    add.cell.ids = NULL)
+
+# process combined dataset
+merged_atac = FindTopFeatures(merged_atac, min.cutoff = 50) %>%
+  RunTFIDF(., method = 3) %>%
+  RunSVD(.)
+
+# check whether components correlate with seq depth
+DepthCor(merged_atac)
+
+# UMAP of merged data before embedding
+merged_atac = RunUMAP(merged_atac, 
+                      reduction = "lsi", 
+                      dims = 2:30)
+
+beforeInt = DimPlot(merged_atac,
+                    group.by = "Sample", 
+                    pt.size = 0.15) + 
+  theme(aspect.ratio = 3/3)
+
+ggsave("02_integration/figs/02_atacUMAP_beforeIntegrateEmbed.png", width = 6, height = 6)
+beforeInt
+```
+
+### Find integration anchors
+Use *all* features to find anchors. 
+```{r atacintegrate}
+# get vector of all features (same for all samples)
+features = rownames(new_atac[[1]])
+
+# calculate lsi in new_atac
+new_atac = map(new_atac, ~ FindTopFeatures(.x, min.cutoff = 50) %>%
+                 RunTFIDF(., method = 3) %>%
+                 RunSVD(.))
+
+# find integration anchors, remove 1st PC
+anchorsATAC = FindIntegrationAnchors(
+  object.list = new_atac,
+  anchor.features = features,
+  reduction = "rlsi",
+  dims = 2:30)
+
+# integrate lsi embeddings
+atac_integrated = IntegrateEmbeddings(
+  anchorset = anchorsATAC,
+  reductions = merged_atac[["lsi"]],
+  new.reduction.name = "integrated_lsi",
+  dims.to.integrate = 1:30)
+```
+
+### Dimensional reduction on integrated ATAC
+```{r dimReduc}
+# check which component correlates w sequencing depth
+DepthCor(atac_integrated, reduction = "integrated_lsi")
+
+# create umap embedding
+atac_integrated = RunUMAP(atac_integrated, 
+                          reduction = "integrated_lsi", 
+                          dims=2:30, 
+                          reduction.name = "atacUMAP", 
+                          reduction.key = "atacUMAP_")
+
+# find neighbors
+atac_integrated = FindNeighbors(atac_integrated,
+                                reduction = "integrated_lsi",
+                                dims = 2:30,
+                                verbose = FALSE)
+
+# find optimal cluster with clustree
+clustree2 = FindClusters(atac_integrated,
+                         resolution = seq(0.25, 1.75, by = 0.25),
+                         algorithm = "4",
+                         method = "igraph",
+                         random.seed = 1,
+                         verbose = F)
+
+# visualize
+clustree(clustree2@meta.data, prefix = "ATAC_snn_res.")
+
+# select resolution 0.5
+atac_integrated = FindClusters(atac_integrated,
+                               resolution = 0.5,
+                               algorithm = "4",
+                               method = "igraph",
+                               random.seed = 1,
+                               verbose = F)
+```
+
+```{r save}
+qsave(atac_integrated, "02_integration/rds/02_atac_integrated.qs", nthreads = 16)
+atac_integrated = qread("02_integration/rds/02_atac_integrated.qs")
+```
+
+### Visualizing UMAP embeddings
+
+All samples in same embedding. 
+```{r umap}
+atacUMAPembed = as.data.frame(Embeddings(atac_integrated,"atacUMAP"))
+
+atacUMAPembed$sample = atac_integrated$Sample
+
+# plot
+atacUMAP_allSamples = ggplot(atacUMAPembed, aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = sample), size = 0.15, show.legend = F) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+ggsave("02_integration/figs/02_atacUMAP_allSamples.png", atacUMAP_allSamples, width = 5, height = 5)
+```
+
+Facet by samples, color by gene activity score of MS4A1. 
+```{r umapGeneScore}
+# genes of interest
+genes = c("MS4A1",
+          "PAX5",
+          "CXCR5",
+          "CD3D",
+          "CD4",
+          "CD8A",
+          "FOXP3",
+          "TBX21",
+          "GATA3",
+          "BCL6",
+          "PDCD1",
+          "HAVCR2",
+          "BCL2",
+          "MKI67")
+
+# get genescore matrix 
+genescore = atac_integrated@assays$GeneScoreImputed@data
+genescore = genescore[genes,]
+
+# join, after confirming all(rownames(atacUMAPembed) == colnames(genescore))
+atacUMAPembed = cbind(atacUMAPembed, t(genescore))
+
+# create a function for umap plotting
+umapFeature = function(df_embed,locus){
+  ggplot(df_embed, aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = .data[[locus]]), size = 0.05) +
+  scale_color_viridis_c(option = "magma") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(sample))
+}
+
+# save, TO DO: lapply
+ms4a1 = umapFeature(atacUMAPembed, "MS4A1")
+cd3d = umapFeature(atacUMAPembed, "CD3D")
+bcl6 = umapFeature(atacUMAPembed, "BCL6")
+bcl2 = umapFeature(atacUMAPembed, "BCL2")
+
+ggsave("02_integration/figs/02_atacUMAP_MS4A1.png", ms4a1, width = 10, height = 5)
+ggsave("02_integration/figs/02_atacUMAP_CD3D.png", cd3d, width = 10, height = 5)
+ggsave("02_integration/figs/02_atacUMAP_BCL6.png", bcl6, width = 10, height = 5)
+ggsave("02_integration/figs/02_atacUMAP_BCL2.png", bcl2, width = 10, height = 5)
+```
