@@ -1,0 +1,274 @@
+---
+title: "sct integration"
+author: "kou"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,include=T,message=F,eval=F,warning=F)
+```
+
+```{r libraries, warning=F}
+library(Signac)
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(shiny)
+library(qs)
+library(reticulate)
+library(clustree)
+
+# always set seed!!! need to repeat
+set.seed(105)
+
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# set python
+use_python("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env/bin")
+use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
+``` 
+
+```{r data_import}
+ln_id = c("LN0025","LN0177","LN0193","LN0438")
+sct_list = qread("01_QC/rds/04_split_sct_noCCreg.qs")
+```
+
+## Integrate through finding anchors and batch correct SCT modalities
+Samples were first normalized independently using SC Transform v2 (see 01_QC/04_gex_norm_final.Rmd), then integrated using pearson residuals.
+3000 features were used as anchors for integration. Including more anchors is not necessarily beneficial, as the additional feautures would have lower weights.
+
+No reference was assigned, so all pairwise anchors are found between all samples.
+
+More info: https://satijalab.org/seurat/articles/sctransform_v2_vignette.html
+```{r integrate_anchors}
+# reformat metadata before integration
+sct_list = lapply(1:4, function(x){
+  # get metadata from sct_list
+  meta = sct_list[[x]]@meta.data
+  
+  # get vector with resolutions
+  res = str_extract(colnames(meta),"res.*")
+  
+  # get col index with RNA_snn_res
+  index_rna_res = str_which(colnames(meta),"RNA_snn_res.")
+  
+  # get col index with SCT_snn_res 
+  index_sct_res = str_which(colnames(meta),"SCT_snn_res.")
+  
+  # rename columns
+  meta = meta %>%
+    mutate(RNA_snn_res = res[index_rna_res],
+           SCT_snn_res = res[index_sct_res]) %>%
+    rename(RNA_snn_clust = colnames(meta)[index_rna_res],
+           SCT_snn_clust = colnames(meta)[index_sct_res])
+  
+  sct_list[[x]]@meta.data = meta
+  
+return(sct_list[[x]])
+})
+
+# ranks features by the number of datasetes that they're variable in, returns top scoring features
+features = SelectIntegrationFeatures(object.list = sct_list, 
+                                     nfeatures = 3000, 
+                                     assay = rep("SCT",length(sct_list)))
+
+sct_list = PrepSCTIntegration(object.list = sct_list,
+                              assay = "SCT", 
+                              anchor.features = features)
+
+# integrate the datasets
+anchors = FindIntegrationAnchors(object.list = sct_list, 
+                                 assay = rep("SCT",length(sct_list)), 
+                                 normalization.method = "SCT", 
+                                 anchor.features = features)
+
+sct_integrated = IntegrateData(anchorset = anchors, 
+                               normalization.method = "SCT")
+```
+
+### Dimensional Reduction
+After integrating data sets, a new "integrated" assay was created, and all reductions were removed. Original RNA and SCT counts are also stored. Metadata seems to be rbind() of metadata from list of Seurat objects. 
+
+Next, perform dimensionality reduction to cluster cells and identify marker genes on the "integrated" assay.
+
+Note: set python interpreter to venv through project options, also used reticulate in set up.
+```{r dim_reduc, warning=F}
+# create umap on sct
+sct_integrated = RunPCA(sct_integrated, 
+                        reduction.name = "sctPCA", 
+                        verbose=F) %>%
+  RunUMAP(., reduction = "sctPCA", 
+          dims = 1:30, 
+          reduction.key = "sctUMAP_", 
+          reduction.name = "sctUMAP", 
+          verbose=F) %>% 
+  FindNeighbors(., reduction = "sctPCA", 
+                dims = 1:30)
+
+# use clustree to find the appropriate resolution, cluster with leiden
+clustree = FindClusters(sct_integrated, 
+                        resolution = seq(0.4,1.15,by = 0.25), 
+                        algorithm = 4, 
+                        method = "igraph", 
+                        random.seed = 1)
+
+# plot to find appropriate resolution
+clustree(clustree@meta.data, prefix = "integrated_snn_res.")
+
+
+# clustering with 0.4
+sct_integrated = FindClusters(sct_integrated, 
+                              resolution = 0.4, 
+                              algorithm = 4, 
+                              method = "igraph", 
+                              random.seed = 1)
+```
+
+```{r save}
+qsave(sct_integrated, "02_integration/rds/02_sct_integrated_noCCreg.qs", nthreads = 16)
+sct_integrated = qread("02_integration/rds/02_sct_integrated_noCCreg.qs")
+```
+
+### Visualizing embeddings
+Subset RNA features to color code embeddings
+```{r features}
+# genes of interest
+genes = c("MS4A1",
+          "PAX5",
+          "CXCR5",
+          "CD3D",
+          "CD4",
+          "CD8A",
+          "FOXP3",
+          "TBX21",
+          "GATA3",
+          "BCL6",
+          "PDCD1",
+          "HAVCR2",
+          "BCL2",
+          "MKI67")
+
+# get norm counts
+normcounts = sct_integrated@assays$RNA@data
+normcounts = normcounts[genes,]
+```
+
+UMAP: All samples in same embedding
+```{r umap}
+sctUMAPembed = as.data.frame(Embeddings(sct_integrated,"sctUMAP"))
+
+sctUMAPembed$sample = sct_integrated$Sample
+
+# plot
+sctUMAP_allSamples = ggplot(sctUMAPembed, aes(sctUMAP_1,sctUMAP_2)) +
+  geom_jitter(aes(color = sample), size = 0.15, show.legend = F) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+ggsave("02_integration/figs/03_sctUMAP_allSamples.png", sctUMAP_allSamples, width = 5, height = 5)
+```
+
+UMAP: Clusters (integrated_snn_res.0.4) faceted by samples. 
+```{r umapClusters}
+sctUMAPembed$clusters = sct_integrated$integrated_snn_res.0.4
+
+# plot
+sctUMAP_clusters = ggplot(sctUMAPembed, aes(sctUMAP_1,sctUMAP_2)) +
+  geom_jitter(aes(color = clusters), size = 0.05, show.legend = T) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank()) +
+  facet_grid(cols = vars(sample))
+
+ggsave("02_integration/figs/03_sctUMAP_clusters.png", sctUMAP_clusters, width = 10, height = 5)
+```
+
+UMAP: Facet by samples, color by normalized RNA counts.
+```{r umapFeature}
+# join, after confirming all(rownames(sctUMAPembed) == colnames(normcounts))
+sctUMAPembed = cbind(sctUMAPembed, t(as.matrix(normcounts)))
+
+# create a function for umap plotting
+umapFeature = function(df_embed,locus){
+  ggplot(df_embed, aes(sctUMAP_1,sctUMAP_2)) +
+  geom_jitter(aes(color = .data[[locus]]), size = 0.05) +
+  scale_color_viridis_c(option = "turbo") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(sample))
+}
+
+# save, TO DO: lapply
+ms4a1 = umapFeature(sctUMAPembed, "MS4A1")
+cd3d = umapFeature(sctUMAPembed, "CD3D")
+bcl6 = umapFeature(sctUMAPembed, "BCL6")
+bcl2 = umapFeature(sctUMAPembed, "BCL2")
+
+ggsave("02_integration/figs/03_sctUMAP_MS4A1.png", ms4a1, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctUMAP_CD3D.png", cd3d, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctUMAP_BCL6.png", bcl6, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctUMAP_BCL2.png", bcl2, width = 10, height = 5)
+```
+
+PCA: clusters faceted by samples. 
+```{r pca}
+sctPCAembed = as.data.frame(Embeddings(sct_integrated,"sctPCA"))
+
+sctPCAembed$sample = sct_integrated$Sample
+
+sctPCAembed$clusters = sct_integrated$integrated_snn_res.0.4
+
+# pc 1 vs pc 2
+sctPCA_clusters = ggplot(sctPCAembed, aes(PC_1,PC_2)) +
+  geom_jitter(aes(color = clusters), size = 0.05, show.legend = T) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank()) +
+  facet_grid(cols = vars(sample))
+
+# pc 3 vs pc 4
+sctPCA_clusters2 = ggplot(sctPCAembed, aes(PC_3,PC_4)) +
+  geom_jitter(aes(color = clusters), size = 0.05, show.legend = T) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank()) +
+  facet_grid(cols = vars(sample))
+
+ggsave("02_integration/figs/03_sctPCA_PC1PC2_clusters.png", sctPCA_clusters, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctPCA_PC3PC4_clusters.png", sctPCA_clusters2, width = 10, height = 5)
+```
+
+PCA: Facet by samples, color by normalized RNA counts (same matrix used for UMAP). 
+```{r pcaFeature}
+# join, after confirming all(rownames(sctUMAPembed) == colnames(normcounts))
+sctPCAembed = cbind(sctPCAembed, t(as.matrix(normcounts)))
+
+# create a function for pca plotting
+pcaFeature = function(df_embed,locus,whichPC1,whichPC2){
+  ggplot(df_embed, aes(.data[[whichPC1]],.data[[whichPC2]])) +
+  geom_jitter(aes(color = .data[[locus]]), size = 0.05) +
+  scale_color_viridis_c(option = "turbo") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        aspect.ratio = 3/3,
+        strip.background = element_blank()) +
+  facet_grid(cols = vars(sample))
+}
+
+# save, TO DO: lapply or shiny app
+ms4a1_pca = pcaFeature(sctPCAembed, "MS4A1","PC_1","PC_2")
+cd3d_pca = pcaFeature(sctPCAembed, "CD3D","PC_1","PC_2")
+mki67_pca = pcaFeature(sctPCAembed, "MKI67","PC_3","PC_4")
+
+ggsave("02_integration/figs/03_sctPCA_MS4A1.png", ms4a1_pca, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctPCA_CD3D.png", cd3d_pca, width = 10, height = 5)
+ggsave("02_integration/figs/03_sctPCA_MKI67.png", mki67_pca, width = 10, height = 5)
+```
