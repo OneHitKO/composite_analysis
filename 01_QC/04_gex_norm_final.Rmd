@@ -32,12 +32,10 @@ use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
 ```{r splitSeuratObj}
 # import
 # object was merged during filtering to match cells kept after QC step in ATAC-seq
-merged = readRDS("./01_QC/rds/03_seur_keep.rds")
-merged_meta = merged@meta.data
+merged = qread("./01_QC/rds/03_seur_keep.qs")
 
 # split merged datasets
-merged$Sample = gsub("#.*","",merged$cell_ids)
-split_seur = SplitObject(merged, split.by = "Sample")
+split_seur = SplitObject(merged, split.by = "orig.ident")
 ```
 
 ### Goals:
@@ -74,8 +72,7 @@ split_seur = SplitObject(merged, split.by = "Sample")
     (and/or other features like mt ratio) explain unwanted variation
 
 ```{r logNorm}
-# get seurat gene list
-ccGenes = cc.genes.updated.2019
+allGenes = rownames(merged)
 
 # normalize and find variable features
 split_logNorm = lapply(split_seur, FUN = function(x){
@@ -117,6 +114,9 @@ split_logNorm = lapply(split_seur, FUN = function(x){
         <https://www.molbiolcell.org/doi/10.1091/mbc.02-02-0030>
 
 ```{r addCellCycleGenes, messsage=F, warning=F}
+# get seurat gene list
+ccGenes = cc.genes.updated.2019
+
 # add score, which is similar to AddModuleScore()
 split_logNorm = map(split_logNorm, ~ CellCycleScoring(.x,
                                                       g2m.features = ccGenes$g2m.genes,
@@ -207,7 +207,7 @@ pcaEmbeds = lapply(split_logNorm, function(seuObj){
 meta = lapply(split_logNorm, function(seuObj){
   seuObj@meta.data %>%
     as_tibble(rownames = "cellID") %>%
-    select(!c("cell_ids","Sample","orig.ident"))
+    select(!c("cell_ids","orig.ident"))
   })
 
 # reformat for plotting2
@@ -374,15 +374,15 @@ lapply(1:4, FUN = function(x){
 **Resolution based off of Clustree analysis:**
 
 -   LN0025: 1
--   LN0177: 1.5
--   LN0193: 1.75
--   LN0438: 1 (or 0.75?)
+-   LN0177: 0.5
+-   LN0193: 0.75
+-   LN0438: 1
 
 Repeat clustering
 
 ```{r final.cluster.lognorm}
 # based off of clustree
-res = c(1,1.5,1.75,1)
+res = c(1,0.5,0.75,1)
 
 # repeat clustering
 split_logNorm = map2(split_logNorm, res, 
@@ -412,7 +412,7 @@ rnaUMAP = lapply(1:4, FUN = function(x){
 
 rnaUMAP = ggarrange(plotlist = rnaUMAP)
 
-ggsave("01_QC/figs/04_rnaUMAP_noCCreg.png",rnaUMAP)
+ggsave("01_QC/figs/04_rnaUMAP_soupx.png",rnaUMAP)
 
 rnaUMAP
 ```
@@ -432,7 +432,7 @@ rnaUMAP_ms4a1 = lapply(1:4, FUN = function(x){
 
 rnaUMAP_ms4a1 = ggarrange(plotlist = rnaUMAP_ms4a1)
 
-ggsave("01_QC/figs/04_rnaUMAP_ms4a1_noCCreg.png",rnaUMAP_ms4a1)
+ggsave("01_QC/figs/04_rnaUMAP_ms4a1_soupx.png",rnaUMAP_ms4a1)
 
 rnaUMAP_ms4a1
 ```
@@ -477,14 +477,14 @@ whichPC
 
 ### sctUMAP
 
--   use "sctPCA" and dims 1:26
+-   use "sctPCA" and dims 1:27
 
 ```{r sctUMAP}
 split_sct = map(split_sct, ~ RunUMAP(.x,
                                      reduction.name = "sctUMAP",
                                      reduction.key = "sctUMAP_",
                                      reduction = "sctPCA",
-                                     dims = 1:26,
+                                     dims = 1:27,
                                      verbose = F))
 ```
 
@@ -494,13 +494,13 @@ split_sct = map(split_sct, ~ RunUMAP(.x,
 # find neighbors and clusters for visualization, use different resolutions
 split_sct = map(split_sct, ~ FindNeighbors(.x,
                                            reduction = "sctPCA", 
-                                           dims = 1:26,
+                                           dims = 1:27,
                                            verbose = FALSE))
 
 # find appropriate resolution using leiden clustering
 # make sure default assay is SCT! 
 test_tree2 = map(split_sct, ~ FindClusters(.x,
-                                           resolution = seq(0.25, 1.75, by = 0.25),
+                                           resolution = seq(0.25, 1.5, by = 0.25),
                                            algorithm = "4",
                                            method = "igraph", 
                                            random.seed = 1,
@@ -519,24 +519,21 @@ lapply(1:4, FUN = function(x){
 
 **Resolution results of Clustree**
 
--   LN0025: 0.75 (1?)
--   LN0177: 0.5 (0.75?)
--   LN0193: 1
--   LN0438: 0.75
+-   LN0025: 0.5
+-   LN0177: 0.5
+-   LN0193: 0.5
+-   LN0438: 0.5
 
 ```{r final.cluster.sct}
-# based off of clustree
-res2 = c(0.75,0.5,1,0.75)
-
 # repeat clustering
-split_sct = map2(split_sct, res2, ~ FindClusters(.x,
-                                                 resolution = .y,
-                                                 algorithm = "4",
-                                                 method = "igraph",
-                                                 random.seed = 1,
-                                                 verbose = F))
+split_sct = map(split_sct, ~ FindClusters(.x,
+                                          resolution = 0.5,
+                                          algorithm = "4",
+                                          method = "igraph",
+                                          random.seed = 1,
+                                          verbose = F))
 
-qsave(split_sct,"./01_QC/rds/04_split_sct_noCCreg.qs",nthreads = 16)
+qsave(split_sct,"./01_QC/rds/04_split_sct.qs",nthreads = 16)
 ```
 
 ### Plot sctUMAP
@@ -546,7 +543,7 @@ qsave(split_sct,"./01_QC/rds/04_split_sct_noCCreg.qs",nthreads = 16)
 sctUMAP = lapply(1:4, FUN = function(x){
   DimPlot(split_sct[[x]], 
           reduction = "sctUMAP", 
-          group.by = paste0("SCT_snn_res.",res2[[x]]),
+          group.by = "SCT_snn_res.0.5",
           pt.size = 0.05,
           label.size = 3,
           label = T) +
@@ -557,7 +554,7 @@ sctUMAP = lapply(1:4, FUN = function(x){
 
 sctUMAP = ggarrange(plotlist = sctUMAP)
 
-ggsave("01_QC/figs/04_sctUMAP_noCCreg.png",sctUMAP)
+ggsave("01_QC/figs/04_sctUMAP_soupx.png",sctUMAP)
 
 sctUMAP
 ```
@@ -577,7 +574,7 @@ sctUMAP_ms4a1 = lapply(1:4, FUN = function(x){
 
 sctUMAP_ms4a1 = ggarrange(plotlist = sctUMAP_ms4a1)
 
-ggsave("01_QC/figs/04_sctUMAP_ms4a1_noCCreg.png",sctUMAP_ms4a1)
+ggsave("01_QC/figs/04_sctUMAP_ms4a1_soupx.png",sctUMAP_ms4a1)
 
 sctUMAP_ms4a1
 ```

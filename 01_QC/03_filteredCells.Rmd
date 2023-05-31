@@ -17,8 +17,8 @@ library(ArchR)
 library(tidyverse)
 ```
 
-```{r data import}
-seur_flt = readRDS("./01_QC/rds/01_seur_filt.rds")
+```{r dataImport}
+seur_flt = qread("./01_QC/rds/01_seur_filt.qs")
 archR_flt = loadArchRProject("./01_QC/ArchRproj_flt")
 
 # merge seurat, get metadata
@@ -26,34 +26,21 @@ seur_flt = merge(seur_flt[[1]],
                  seur_flt[-1],
                  add.cell.ids = names(seur_flt))
 
-# rename cell_id columns to match style of ArchR
-## TO DO: find a different way, so not to change style of Seurat! like get indeces
-seur_flt$cell_ids = gsub("_","#",colnames(seur_flt))
-
-# get metadata
-archR_meta = getCellColData(archR_flt)
-seur_meta = seur_flt@meta.data
-```
-
-Get cell IDs that are present in both
-```{r get keep ids, include=T}
+# get cell names
 atac_cells = archR_flt$cellNames
-rna_cells = seur_meta$cell_ids
+rna_cells = Cells(seur_flt)
 
 # get intersection
-keep_ids = intersect(atac_cells,rna_cells)
-```
+keep_ids = intersect(atac_cells, gsub("_","#",rna_cells))
 
-Subset Seurat and ArchR objects
-```{r subset rna, include=T}
 # subset
-seur_keep = subset(seur_flt, subset = (cell_ids %in% keep_ids))
-saveRDS(seur_keep, "./01_QC/rds/03_seur_keep.rds")
+seur_keep = seur_flt[,rna_cells %in% gsub("#","_",keep_ids)]
+qsave(seur_keep, "./01_QC/rds/03_seur_keep.qs", nthreads=16)
 
 # TO DO: use subsetArchRProject() to drop cells in arrow files!
 archR_keep = archR_flt[archR_flt$cellNames %in% keep_ids,]
 saveArchRProject(ArchRProj = archR_keep, 
-                             outputDirectory = "01_QC/ArchRproj_keep", 
+                             outputDirectory = "01_QC/archRprojects/ArchRproj_keep", 
                              load = F)
 ```
 
