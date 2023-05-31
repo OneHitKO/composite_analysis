@@ -13,11 +13,21 @@ knitr::opts_chunk$set(echo = TRUE)
 Resources:
 * https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/04_SC_quality_control.md
 * https://www.10xgenomics.com/resources/analysis-guides/common-considerations-for-quality-control-filters-for-single-cell-rna-seq-data
+
+### Correcting ambient RNA contamination with SoupX 
+Resources:
+* https://github.com/hbctraining/scRNA-seq_online/blob/master/lessons/04_SC_quality_control.md
+* https://www.10xgenomics.com/resources/analysis-guides/common-considerations-for-quality-control-filters-for-single-cell-rna-seq-data
 ```{r setup, include=T, message=F}
 library(Seurat)
 library(tidyverse)
 library(ggpubr)
 library(ggridges)
+library(cowplot)
+library(SoupX)
+library(scDblFinder)
+library(DropletUtils)
+library(qs)
 theme_set(theme_bw())
 
 set.seed(105)
@@ -25,19 +35,126 @@ set.seed(105)
 
 ### GEX data import
 Individual modalities are preprocessed separately prior to integration.
-```{r import data, include=T}
+```{r importdata, include=T}
 # list of samples
 ln_id = c("LN0025","LN0177","LN0193","LN0438")
 
-path = paste0("~/projects/composite/cellranger/",ln_id,"/outs/filtered_feature_bc_matrix/")
+# raw features = "table of droplets"
+droplets = paste0("~/projects/composite/cellranger/",ln_id,"/outs/raw_feature_bc_matrix/")
 
-# get list of files from cellranger outs folders
+# filtered features = "table of counts"
+counts = paste0("~/projects/composite/cellranger/",ln_id,"/outs/filtered_feature_bc_matrix/")
+
+# create list of files from cellranger outs folders
 # contains both gex AND atac
-data = lapply(path,Read10X)
-names(data) = ln_id
+list_drop = lapply(droplets,Read10X)
+list_count = lapply(counts,Read10X)
+names(list_drop) = ln_id
+names(list_count) = ln_id
 
-# create list of unfiltered seurat objects from GEX only
-seur_unfilt = map2(data, names(data), ~ CreateSeuratObject(.x$`Gene Expression`, project = .y))
+# separate gex and atac
+gex_drop = map(list_drop, ~ .x$`Gene Expression`)
+gex_count = map(list_count, ~ .x$`Gene Expression`)
+```
+
+### Creating `SoupChannel` objects
+* input required: table of droplets and table of counts
+* also need to add clustering and dimensionality reduction embeddings to metadata
+* can use `cellranger` preliminary analysis outputs
+
+TO DO: compare cellranger clustering with seurat clustering
+
+```{r createSoupChannelObject}
+list_soup = map2(gex_drop, gex_count, ~ SoupChannel(.x,.y))
+
+# get clustering data, use cell ranger output
+clusterPath = paste0("~/projects/composite/cellranger/",
+                     ln_id,
+                     "/outs/analysis/clustering/gex/graphclust")
+
+clusterFiles = list.files(path=clusterPath, pattern="clusters.csv", full.names=T)
+
+list_clusters = lapply(clusterFiles, read_csv)
+names(list_clusters) = ln_id
+
+# add clusters to soup channel
+# checked all(rownames(list_soup$LN0025$metaData) == list_clusters$LN0025$Barcode)
+list_soup = map2(list_soup, list_clusters, ~ setClusters(.x,.y$Cluster))
+
+# get umap embeddings
+umapPath = paste0("~/projects/composite/cellranger/",
+                  ln_id,
+                  "/outs/analysis/dimensionality_reduction/gex")
+
+umapFiles = list.files(path = umapPath, pattern="umap_projection.csv", full.names=T)
+
+list_umap = lapply(umapFiles, read_csv)
+names(list_umap) = ln_id
+
+# add umap embeddings to soup channel
+list_soup = map2(list_soup, list_umap, ~ setDR(.x,.y[c("UMAP-1","UMAP-2")],"UMAP"))
+```
+
+### Visualization of contamination
+Before removal soup contamination
+```{r umapBefore_soupCorrection}
+# create function
+umap_before = lapply(1:4, function(x){
+  ggplot(list_soup[[x]]$metaData, aes(UMAP_1,UMAP_2))+
+    geom_jitter(aes(color=clusters), size=0.5)+
+    theme(aspect.ratio = 3/3,
+          panel.grid = element_blank()) +
+    labs(title = names(list_soup)[[x]])
+})
+
+plot_grid(plotlist = umap_before)
+```
+
+Before soup contamination removal: check expression of cell-specific markers (count > 1)
+```{r ms4a1_beforeCorrection}
+# create function
+featureUMAP = function(soupchannelobj,gene){
+  ggplot(soupchannelobj$metaData, aes(UMAP_1,UMAP_2))+
+    geom_jitter(aes(color = soupchannelobj$toc[gene,]>1), size=0.25, alpha = 0.2)+
+    theme(aspect.ratio = 3/3,
+          panel.grid = element_blank())+
+    labs(color = toString(gene))
+}
+
+# on demand plotting
+plot_grid(plotlist = lapply(list_soup,featureUMAP, gene = "CD3G"))
+```
+
+Plot to see if expression is more than expected in soup. 
+In the "CD247" (CD3 zeta) example, can see that the B cell clusters do not overcome threshold above soup! 
+```{r markermap}
+plot_grid(plotlist = lapply(list_soup, plotMarkerMap, geneSet = "CD3G", pointSize = 1.5))
+```
+
+### Estimating contaminating fraction (automated)
+Can do this manually by specifying a set of "non expressed genes" that should NOT be expressed in some cell types/clusters, or can do it automatically. 
+
+"The key thing to understand is that the contamination fraction estimate is the fraction of your data that will be discarded. If this value is set too low, your “corrected” data will potentially still be highly contaminated. If you set it too high, you will discard real data, although there are good reasons to want to do this at times (see section below). If the contamination fraction is in the right ball park, SoupX will remove most of the contamination. It will generally not matter if this number if off by a few percent."
+
+For now, do automated estimation. 
+
+Contamination fraction set to 15% to remove >98% of the contamination. 
+```{r automatedEstimation}
+# set contamination fraction
+list_soup = lapply(list_soup, setContaminationFraction, contFrac=0.15)
+
+# automated contamination estimation
+list_soup = lapply(list_soup, autoEstCont)
+```
+
+### Correcting expression profile
+Method = subtraction
+```{r correction}
+out = lapply(list_soup, adjustCounts)
+qsave(out,"01_QC/rds/00_out.qs", nthreads = 16)
+
+# create seurat
+seur_unfilt = map2(out, names(out), ~ CreateSeuratObject(.x, project = .y))
 ```
 
 ### QC metrics
@@ -63,6 +180,7 @@ seur_unfilt = lapply(seur_unfilt, calc_noveltyScore)
 seur_unfilt = lapply(seur_unfilt, calc_mt)
 ```
 
+Basic visaulization with box plots. 
 ```{r plot all test2, include=T, warning=F}
 # get list of metadata
 ## TO DO: troubleshoot this??
@@ -143,6 +261,7 @@ ggarrange(p1,p2,p3,p4,
 
 ggsave("01_QC/figs/01_gexQC_densityCutoff.png")
 ```
+
 ### Determining outliers by IQR
 Mark which cells are outliers based on whether nCount_RNA and nFeature_RNA < Q1-1.5IQR or > Q3 + 1.5IQR.
 ```{r IQR calc, include=T}
@@ -167,7 +286,6 @@ find_outliers = function(seurObj){
 toDISCARD = lapply(seur_unfilt,find_outliers)
 ```
 
-
 ### Filtering cells on MERGED dataset
 Used the following filtering parameters:
 * cells are not outliers
@@ -184,14 +302,34 @@ seur_unfilt = lapply(seur_unfilt, function(x){
 })
 
 # need function for map2 to work within subset function
-'%!in%' <- function(x,y)!('%in%'(x,y))
+'%ni%' <- function(x,y)!('%in%'(x,y))
 
 # subset cells
 seur_filt = map2(seur_unfilt, toDISCARD, ~ subset(.x, subset = (nCount_RNA >= 500) &
                                                     (nCount_RNA <= 50000) &
-                                                    (cell_ids %!in% .y) &
+                                                    (cell_ids %ni% .y) &
                                                     (log10Genes_per_UMI >= 0.85) &
                                                     (ratio_mt <= 0.15)))
+```
+
+### Remove doublets with scDblFinder
+* Needed to remove low quality cells first (ie: low read counts / features)
+* Assumes rate of doublets predicted by 10X ("By default this is assumed to be 1% per thousand cells captured (so 4% among 4000 thousand cells), which is appropriate for 10x datasets. Corrections for homeotypic doublets will be performed on the given rate.")
+```{r scDblFinder}
+# convert to SingleCellExperiment class
+seur_sce = lapply(seur_filt, as.SingleCellExperiment)
+
+# find doublets without clustering
+seur_sce = map(seur_sce, ~ scDblFinder(.x, clusters = F))
+
+# filter cells based on predicted singlet or doublet
+# check that all(colnames(seur_sce[[1]]) == colnames(seur_filt[[1]]))
+seur_filt = lapply(1:4, function(x){
+  filt2 = seur_filt[[x]][,seur_sce[[x]]$scDblFinder.class == "singlet"]
+  return(filt2)
+})
+
+names(seur_filt) = ln_id
 ```
 
 Number of cells before and after initial filtering:
@@ -219,9 +357,10 @@ bind_rows(df1,df2) %>%
 
 ggsave("./01_QC/figs/01_rnaFilt_summary.png",width=5,height = 3)
 ```
+
 Before downstream steps (ie: normalization, scaling, annotation, actual analysis, etc), need to QC cells based on ATAC seq by using ArchR. 
 Afterwards, cells/barcodes that are still present after filtering each modality individual will be used for next steps.
 ```{r save rds, include=F}
-saveRDS(seur_filt, "./01_QC/rds/01_seur_filt.rds")
+qsave(seur_filt, "./01_QC/rds/01_seur_filt.qs", nthreads = 16)
 ```
 
