@@ -44,7 +44,7 @@ Chromatin Assay needs:
 
 ```{r import data, include=T}
 # load archR proj after filtering cells from RNA and ATAC
-archR_keep = loadArchRProject("01_QC/ArchRproj_keep/")
+archR_keep = loadArchRProject("01_QC/archRprojects/ArchRproj_keep/")
 
 # separate archR by samples
 archR_LN0025 = archR_keep[archR_keep$Sample == "LN0025",]
@@ -56,7 +56,7 @@ archR_LN0438 = archR_keep[archR_keep$Sample == "LN0438",]
 archR_all = c(archR_LN0025,archR_LN0177,archR_LN0193,archR_LN0438)
 
 # create list of outputDirectory to save ArchR projects
-outDir = paste0("01_QC/ArchR_",c("LN0025","LN0177","LN0193","LN0438"))
+outDir = paste0("01_QC/archRprojects/ArchR_",c("LN0025","LN0177","LN0193","LN0438"))
 
 # save all projects
 map2(archR_all, outDir, ~ saveArchRProject(ArchRProj = .x, outputDirectory = .y, load = F))

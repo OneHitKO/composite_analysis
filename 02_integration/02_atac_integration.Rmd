@@ -201,6 +201,26 @@ atacUMAP_allSamples = ggplot(atacUMAPembed, aes(atacUMAP_1,atacUMAP_2)) +
 ggsave("02_integration/figs/02_atacUMAP_allSamples.png", atacUMAP_allSamples, width = 5, height = 5)
 ```
 
+Clusters faceted by samples. 
+```{r umapClusters}
+atacUMAPembed$clusters = atac_integrated$ATAC_snn_res.0.5
+
+# plot
+atacUMAP_clusters = ggplot(atacUMAPembed, aes(atacUMAP_1,atacUMAP_2)) +
+  geom_jitter(aes(color = clusters), size = 0.15) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank()) +
+  facet_grid(cols = vars(sample))
+
+ggsave("02_integration/figs/02_atacUMAP_clusters.png", atacUMAP_clusters, width = 10, height = 5)
+
+atacUMAP_clusters
+```
+
+
 Facet by samples, color by gene activity score of MS4A1. 
 ```{r umapGeneScore}
 # genes of interest

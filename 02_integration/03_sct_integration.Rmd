@@ -31,7 +31,7 @@ use_virtualenv("/g/scb/zaugg/kou/projects/composite/analysis/sc_py_env")
 
 ```{r data_import}
 ln_id = c("LN0025","LN0177","LN0193","LN0438")
-sct_list = qread("01_QC/rds/04_split_sct_noCCreg.qs")
+sct_list = qread("01_QC/rds/04_split_sct.qs")
 ```
 
 ## Integrate through finding anchors and batch correct SCT modalities
@@ -117,17 +117,17 @@ clustree = FindClusters(sct_integrated,
 clustree(clustree@meta.data, prefix = "integrated_snn_res.")
 
 
-# clustering with 0.4
+# clustering with 0.65
 sct_integrated = FindClusters(sct_integrated, 
-                              resolution = 0.4, 
+                              resolution = 0.65, 
                               algorithm = 4, 
                               method = "igraph", 
                               random.seed = 1)
 ```
 
 ```{r save}
-qsave(sct_integrated, "02_integration/rds/02_sct_integrated_noCCreg.qs", nthreads = 16)
-sct_integrated = qread("02_integration/rds/02_sct_integrated_noCCreg.qs")
+qsave(sct_integrated, "02_integration/rds/03_sct_integrated.qs", nthreads = 16)
+sct_integrated = qread("02_integration/rds/03_sct_integrated.qs")
 ```
 
 ### Visualizing embeddings
@@ -158,7 +158,7 @@ UMAP: All samples in same embedding
 ```{r umap}
 sctUMAPembed = as.data.frame(Embeddings(sct_integrated,"sctUMAP"))
 
-sctUMAPembed$sample = sct_integrated$Sample
+sctUMAPembed$sample = sct_integrated$orig.ident
 
 # plot
 sctUMAP_allSamples = ggplot(sctUMAPembed, aes(sctUMAP_1,sctUMAP_2)) +
@@ -174,7 +174,7 @@ ggsave("02_integration/figs/03_sctUMAP_allSamples.png", sctUMAP_allSamples, widt
 
 UMAP: Clusters (integrated_snn_res.0.4) faceted by samples. 
 ```{r umapClusters}
-sctUMAPembed$clusters = sct_integrated$integrated_snn_res.0.4
+sctUMAPembed$clusters = sct_integrated$integrated_snn_res.0.65
 
 # plot
 sctUMAP_clusters = ggplot(sctUMAPembed, aes(sctUMAP_1,sctUMAP_2)) +
@@ -217,6 +217,7 @@ ggsave("02_integration/figs/03_sctUMAP_CD3D.png", cd3d, width = 10, height = 5)
 ggsave("02_integration/figs/03_sctUMAP_BCL6.png", bcl6, width = 10, height = 5)
 ggsave("02_integration/figs/03_sctUMAP_BCL2.png", bcl2, width = 10, height = 5)
 ```
+
 
 PCA: clusters faceted by samples. 
 ```{r pca}
@@ -272,3 +273,85 @@ ggsave("02_integration/figs/03_sctPCA_MS4A1.png", ms4a1_pca, width = 10, height 
 ggsave("02_integration/figs/03_sctPCA_CD3D.png", cd3d_pca, width = 10, height = 5)
 ggsave("02_integration/figs/03_sctPCA_MKI67.png", mki67_pca, width = 10, height = 5)
 ```
+
+### Test Merging
+Redo SCT transformation after merging
+```{r merge}
+sct_merge = merge(sct_list[[1]], sct_list[-1], add.cell.ids = NULL)
+
+# only keep RNA assay
+DefaultAssay(sct_merge) = "RNA"
+sct_merge = DietSeurat(sct_merge, assays = "RNA")
+
+# repeat sctransform with all samples
+sct_merge = SCTransform(sct_merge, vst.flavor = "v2", residual.features = NULL)
+
+# repeat PCA
+sct_merge = RunPCA(sct_merge, 
+                   npcs = 30,
+                   reduction.name = "sctPCA",
+                   reduction.key = "sctPC_",
+                   verbose = F)
+
+# see % variance for each pc in sctPCA dimen reduc obj
+pct = sct_merge[["sctPCA"]]@stdev / sum(sct_merge[["sctPCA"]]@stdev) * 100
+
+# get cumulative sums to quantitatively determine dimensionality
+cumsum_pct = cumsum(pct)
+
+# determine the first PC that has cum variance of 90%, but explains less than 5% (use for umap) 
+which(cumsum_pct > 90 & pct < 5)[1]
+```
+
+Run UMAP
+```{r mergeUMAP}
+sct_merge = RunUMAP(sct_merge,
+                    reduction.name = "sctUMAP",
+                    reduction.key = "sctUMAP_",
+                    reduction = "sctPCA",
+                    dims = 1:25,
+                    verbose = F)
+
+sct_merge = FindNeighbors(sct_merge,
+                          reduction = "sctPCA", 
+                          dims = 1:25,
+                          verbose = FALSE)
+
+# find clusters
+clustree2 = FindClusters(sct_merge,
+                         resolution = seq(0.5, 1.25, by = 0.25),
+                         algorithm = "4",
+                         method = "igraph", 
+                         random.seed = 1,
+                         verbose = F)
+
+clustree(clustree2@meta.data, prefix = "SCT_snn_res.")
+```
+
+```{r mergeClustering}
+sct_merge = FindClusters(sct_merge,
+                         resolution = 0.5,
+                         algorithm = "4",
+                         method = "igraph",
+                         random.seed = 1,
+                         verbose = F)
+
+qsave(sct_merge, "02_integration/rds/03_sct_merge.qs", nthreads = 16)
+```
+
+Visualization
+```{r}
+sctUMAPembed2 = as.data.frame(Embeddings(sct_merge,"sctUMAP"))
+
+sctUMAPembed2$sample = sct_merge$orig.ident
+
+# plot
+sctUMAP_allSamples2 = ggplot(sctUMAPembed2, aes(sctUMAP_1,sctUMAP_2)) +
+  geom_jitter(aes(color = sample), size = 0.15, show.legend = F) +
+  theme_bw() +
+  theme(aspect.ratio = 3/3,
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+```
+

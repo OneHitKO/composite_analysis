@@ -29,7 +29,7 @@ options(future.globals.maxSize = 4000 * 1024^2)
 
 Load ArchR projects
 ```{r load projects}
-dir = paste0("01_QC/ArchR_",c("LN0025","LN0177","LN0193","LN0438"))
+dir = paste0("01_QC/archRprojects/ArchR_",c("LN0025","LN0177","LN0193","LN0438"))
 
 archR_all = lapply(dir,loadArchRProject)
 ```
